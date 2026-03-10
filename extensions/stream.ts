@@ -96,8 +96,15 @@ export default function streamExtension(pi: ExtensionAPI) {
 	pi.on("tool_execution_start", async (event) => {
 		if (!pi.getFlag("stream")) return;
 
-		const label = formatToolLabel(event.toolName, event.args ?? {});
+		const args = event.args ?? {};
+		const label = formatToolLabel(event.toolName, args);
 		process.stderr.write(ansi.cyan(`[${label}]`) + "\n");
+
+		// Display tool arguments
+		for (const [key, value] of Object.entries(args)) {
+			const valStr = typeof value === "string" ? value : JSON.stringify(value);
+			process.stderr.write(ansi.dim(`  ${key}: ${truncate(valStr, 200)}`) + "\n");
+		}
 	});
 
 	pi.on("tool_execution_end", async (event) => {
