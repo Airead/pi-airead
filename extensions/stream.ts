@@ -6,7 +6,7 @@
  * output (e.g. `-p` text mode or `--mode stream`).
  *
  * Output (all stderr):
- * - text_delta: dim (streaming preview, visually distinct from final stdout)
+ * - text_delta: blue (streaming preview, visually distinct from final stdout)
  * - thinking_delta: dim italic
  * - tool labels: cyan
  * - tool errors: red
@@ -18,6 +18,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 const ansi = {
 	dim: (s: string) => `\x1b[2m${s}\x1b[22m`,
 	italic: (s: string) => `\x1b[3m${s}\x1b[23m`,
+	blue: (s: string) => `\x1b[34m${s}\x1b[39m`,
 	cyan: (s: string) => `\x1b[36m${s}\x1b[39m`,
 	red: (s: string) => `\x1b[31m${s}\x1b[39m`,
 	reset: "\x1b[0m",
@@ -83,7 +84,7 @@ export default function streamExtension(pi: ExtensionAPI) {
 				break;
 
 			case "text_delta":
-				process.stderr.write(ansi.dim(e.delta));
+				process.stderr.write(ansi.blue(e.delta));
 				break;
 
 			case "text_end":
