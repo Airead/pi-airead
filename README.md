@@ -1,6 +1,6 @@
 # pi-airead
 
-Personal extensions for [pi coding-agent](https://github.com/nicepkg/pi-mono).
+Personal extensions for [pi coding-agent](https://github.com/badlogic/pi-mono).
 
 ## Installation
 
