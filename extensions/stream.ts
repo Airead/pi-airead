@@ -6,7 +6,7 @@
  * output (e.g. `-p` text mode or `--mode stream`).
  *
  * Output (all stderr):
- * - text_delta: white (human-readable streaming)
+ * - text_delta: dim (streaming preview, visually distinct from final stdout)
  * - thinking_delta: dim italic
  * - tool labels: cyan
  * - tool errors: red
@@ -83,7 +83,7 @@ export default function streamExtension(pi: ExtensionAPI) {
 				break;
 
 			case "text_delta":
-				process.stderr.write(e.delta);
+				process.stderr.write(ansi.dim(e.delta));
 				break;
 
 			case "text_end":
