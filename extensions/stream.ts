@@ -1,11 +1,15 @@
 /**
  * Stream Extension
  *
- * Streams thinking, tool calls, and text replies to the terminal.
+ * Streams thinking, tool calls, and text replies to the terminal via stderr.
+ * All output goes to stderr so it never conflicts with the built-in stdout
+ * output (e.g. `-p` text mode or `--mode stream`).
  *
- * Output strategy:
- * - stdout: text_delta (text replies, pipeable)
- * - stderr: thinking_delta (dim italic), tool labels (cyan), tool errors (red)
+ * Output (all stderr):
+ * - text_delta: white (human-readable streaming)
+ * - thinking_delta: dim italic
+ * - tool labels: cyan
+ * - tool errors: red
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
@@ -79,12 +83,11 @@ export default function streamExtension(pi: ExtensionAPI) {
 				break;
 
 			case "text_delta":
-				process.stdout.write(e.delta);
+				process.stderr.write(e.delta);
 				break;
 
 			case "text_end":
-				// Ensure newline after text block
-				process.stdout.write("\n");
+				process.stderr.write("\n");
 				break;
 		}
 	});

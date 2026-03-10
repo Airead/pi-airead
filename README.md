@@ -8,8 +8,12 @@ Personal extensions for [pi coding-agent](https://github.com/nicepkg/pi-mono).
 
 Streams assistant thinking, tool calls, and text replies to the terminal during agent execution.
 
-- **stdout**: text deltas (pipeable)
-- **stderr**: thinking (dim italic), tool labels (cyan), tool errors (red)
+All output goes to **stderr** so it never conflicts with built-in stdout output (`-p` text mode, `--mode stream`, etc.):
+
+- text deltas (white)
+- thinking (dim italic)
+- tool labels (cyan)
+- tool errors (red)
 
 #### Usage
 
