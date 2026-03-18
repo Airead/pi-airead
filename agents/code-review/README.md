@@ -38,8 +38,8 @@ The agent runs in a loop:
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `--repo <owner/repo>` | Yes | GitHub repository to review |
-| `--data-dir <path>` | Yes | Directory for runtime data (state/ and workspace/) |
-| `--interval <hours>` | No | Hours between review cycles (default: 1) |
+| `--data-dir <path>` | Yes | Directory for runtime data (state/ and workspace/). Relative paths are auto-resolved to absolute. |
+| `--interval <hours>` | No | Hours between review cycles (default: 1, range: 0.1–24) |
 
 ### Examples
 
@@ -104,6 +104,22 @@ agents/code-review/               # Project directory (checked into git)
 | `findings-cache.json` | Priority queue of findings sorted by severity. Max 10 items. One is verified per cycle |
 | `sessions.json` | References to sub-agent session files for debugging |
 | `daily-stats.json` | Tracks cycle count per day to enforce daily limits |
+| `pending-findings.json` | Transient output from the review round (overwritten each cycle) |
+| `verify-result.json` | Transient output from the verify round (overwritten each cycle) |
+
+## Safety Limits
+
+| Limit | Value | Description |
+|-------|-------|-------------|
+| Max cycles per day | 20 | Prevents runaway API usage. Resets at midnight (UTC). |
+| Circuit breaker | 5 consecutive failures | Stops the loop automatically. Use `/review-start` to reset and resume. |
+| Max repo size | 500 MB | Repositories exceeding this are refused at clone time. |
+| Interval range | 0.1–24 hours | Values outside this range are clamped. Invalid input defaults to 1 hour. |
+| Failure backoff | Exponential (2^n × base) | Each consecutive failure doubles the wait time. Resets on success. |
+| Sub-agent tool calls | 50 per round | Aborts the sub-agent if exceeded, preventing infinite tool loops. |
+| Sub-agent timeout | 5 min (review), 3 min (verify) | Hard timeout per round. |
+| Session retention | 7 days | Old sub-agent session files are cleaned up after each successful cycle. |
+| Reviewed files cap | 5000 per repo | When exceeded, the oldest half is trimmed. |
 
 ## GitHub Issues
 
