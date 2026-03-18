@@ -103,7 +103,7 @@ export default function streamExtension(pi: ExtensionAPI) {
 		// Display tool arguments
 		for (const [key, value] of Object.entries(args)) {
 			const valStr = typeof value === "string" ? value : JSON.stringify(value);
-			process.stderr.write(ansi.dim(`  ${key}: ${truncate(valStr, 200)}`) + "\n");
+			process.stderr.write(ansi.cyan(ansi.dim(`  ${key}: ${truncate(valStr, 200)}`)) + "\n");
 		}
 	});
 
