@@ -1,12 +1,40 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // ============================================================================
+// Resource Safety Limits
+// ============================================================================
+
+const LIMITS = {
+	/** Max review cycles per calendar day */
+	maxCyclesPerDay: 20,
+	/** Max tool calls per sub-agent before abort */
+	maxToolCallsPerSubAgent: 50,
+	/** Review sub-agent timeout (ms) */
+	reviewTimeoutMs: 300_000,
+	/** Verify sub-agent timeout (ms) */
+	verifyTimeoutMs: 180_000,
+	/** Stop loop after N consecutive failures */
+	maxConsecutiveFailures: 5,
+	/** Delete session files older than N days */
+	sessionRetentionDays: 7,
+	/** Max entries in reviewed-files per repo */
+	maxReviewedFilesPerRepo: 5000,
+	/** Max repo size in MB (refuse to clone larger repos) */
+	maxRepoSizeMb: 500,
+} as const;
+
+// ============================================================================
 // Types
 // ============================================================================
+
+interface DailyStats {
+	date: string;
+	cycleCount: number;
+}
 
 interface Finding {
 	file: string;
@@ -338,6 +366,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 	const sessionsPath = join(stateDir, "sessions.json");
 	const findingsOutputPath = join(stateDir, "pending-findings.json");
 	const verifyOutputPath = join(stateDir, "verify-result.json");
+	const dailyStatsPath = join(stateDir, "daily-stats.json");
 
 	// Detect pi CLI entry point for spawning sub-agents
 	const piCliPath = process.argv[1];
@@ -407,8 +436,11 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			const count = Object.keys(repoReviewed).length;
 			const cache = readJson<Finding[]>(findingsCachePath, []);
 			const cycle = readJson<CycleState>(cycleStatePath, { status: "idle" });
+			const today = new Date().toISOString().slice(0, 10);
+			const stats = readJson<DailyStats>(dailyStatsPath, { date: today, cycleCount: 0 });
+			const todayCycles = stats.date === today ? stats.cycleCount : 0;
 			ctx.ui.notify(
-				`Repo: ${repo} | Reviewed: ${count} files | Cached findings: ${cache.length} | Cycle: ${cycle.status} | Loop: ${loopActive ? "active" : "stopped"}`,
+				`Repo: ${repo} | Reviewed: ${count} files | Cached findings: ${cache.length} | Cycle: ${cycle.status} | Loop: ${loopActive ? "active" : "stopped"} | Today: ${todayCycles}/${LIMITS.maxCyclesPerDay} cycles | Failures: ${consecutiveFailures}`,
 				"info",
 			);
 		},
@@ -445,20 +477,59 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 	let loopActive = false;
 	let loopTimer: ReturnType<typeof setTimeout> | null = null;
 	let isRunning = false;
+	let consecutiveFailures = 0;
 
 	function startReviewLoop(repo: string, ctx: any): void {
 		if (loopActive) return;
 		loopActive = true;
+		consecutiveFailures = 0;
 
 		const intervalHours = parseFloat((pi.getFlag("review-interval") as string) ?? "1") || 1;
-		const intervalMs = intervalHours * 3600_000;
+		const baseIntervalMs = intervalHours * 3600_000;
 
 		const loop = async () => {
 			if (!loopActive) return;
+
+			// Daily cycle limit
+			const today = new Date().toISOString().slice(0, 10);
+			const stats = readJson<DailyStats>(dailyStatsPath, { date: today, cycleCount: 0 });
+			if (stats.date !== today) {
+				stats.date = today;
+				stats.cycleCount = 0;
+			}
+			if (stats.cycleCount >= LIMITS.maxCyclesPerDay) {
+				ctx.ui.notify(
+					`Daily cycle limit reached (${LIMITS.maxCyclesPerDay}). Waiting until tomorrow.`,
+					"warning",
+				);
+				// Wait until next day (check every hour)
+				if (loopActive) loopTimer = setTimeout(loop, 3600_000);
+				return;
+			}
+
 			await runCycle(repo, ctx);
+
+			// Update daily stats
+			stats.cycleCount++;
+			atomicWriteJson(dailyStatsPath, stats);
+
+			// Circuit breaker
+			if (consecutiveFailures >= LIMITS.maxConsecutiveFailures) {
+				ctx.ui.notify(
+					`Circuit breaker: ${consecutiveFailures} consecutive failures. Loop stopped. Use /review-start to resume.`,
+					"error",
+				);
+				loopActive = false;
+				return;
+			}
+
 			if (loopActive) {
-				loopTimer = setTimeout(loop, intervalMs);
-				ctx.ui.notify(`Next review in ${intervalHours} hour(s)`, "info");
+				// Back off on failures: double interval for each consecutive failure
+				const backoffMultiplier = consecutiveFailures > 0 ? Math.pow(2, consecutiveFailures) : 1;
+				const actualInterval = baseIntervalMs * backoffMultiplier;
+				const hours = (actualInterval / 3600_000).toFixed(1);
+				loopTimer = setTimeout(loop, actualInterval);
+				ctx.ui.notify(`Next review in ${hours} hour(s)`, "info");
 			}
 		};
 
@@ -526,8 +597,17 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 
 			// Step 5: Finish
 			finishCycle(repo, file);
+			consecutiveFailures = 0;
+
+			// Housekeeping after successful cycle
+			cleanupOldSessions();
+			trimReviewedFiles(repo);
 		} catch (err: any) {
-			ctx.ui.notify(`Review cycle error: ${err.message}`, "error");
+			consecutiveFailures++;
+			ctx.ui.notify(
+				`Review cycle error (failure ${consecutiveFailures}/${LIMITS.maxConsecutiveFailures}): ${err.message}`,
+				"error",
+			);
 			updateCycleState({ status: "idle" });
 		} finally {
 			isRunning = false;
@@ -567,6 +647,27 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 		const repoDir = join(workspaceDir, repoName);
 
 		try {
+			// Check repo size before first clone
+			if (!existsSync(join(repoDir, ".git"))) {
+				try {
+					const repoInfo = execFileSync("gh", ["api", `repos/${repo}`, "--jq", ".size"], {
+						encoding: "utf-8",
+						stdio: ["pipe", "pipe", "pipe"],
+						timeout: 15_000,
+					}).trim();
+					const sizeKb = parseInt(repoInfo, 10);
+					if (!isNaN(sizeKb) && sizeKb / 1024 > LIMITS.maxRepoSizeMb) {
+						ctx.ui.notify(
+							`Repository ${repo} is ${(sizeKb / 1024).toFixed(0)}MB, exceeds ${LIMITS.maxRepoSizeMb}MB limit. Skipping.`,
+							"error",
+						);
+						return null;
+					}
+				} catch {
+					// Size check is best-effort, proceed with clone
+				}
+			}
+
 			if (existsSync(join(repoDir, ".git"))) {
 				// Verify and pull
 				try {
@@ -726,9 +827,15 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			args: ["--skill", reviewSkillPath, "--no-extensions"],
 		});
 
+		let toolCallCount = 0;
 		const unsubscribe = client.onEvent((event: any) => {
 			if (event.type === "tool_execution_start") {
-				ctx.ui.notify(`[Review] Tool: ${event.toolName}`, "info");
+				toolCallCount++;
+				ctx.ui.notify(`[Review] Tool (${toolCallCount}/${LIMITS.maxToolCallsPerSubAgent}): ${event.toolName}`, "info");
+				if (toolCallCount >= LIMITS.maxToolCallsPerSubAgent) {
+					ctx.ui.notify("[Review] Tool call limit reached, aborting sub-agent", "warning");
+					client.abort().catch(() => {});
+				}
 			}
 			if (event.type === "tool_execution_end" && event.isError) {
 				ctx.ui.notify(`[Review] Tool error: ${event.toolName}`, "warning");
@@ -746,7 +853,7 @@ Use the "review" skill to guide your review process. Read the skill file to get 
 **Findings output path:** ${findingsOutputPath}
 
 Review the file thoroughly and write your findings as a JSON array to the output path.`,
-				600_000,
+				LIMITS.reviewTimeoutMs,
 			);
 
 			// Save session reference
@@ -823,9 +930,15 @@ Review the file thoroughly and write your findings as a JSON array to the output
 			args: ["--skill", verifySkillPath, "--no-extensions"],
 		});
 
+		let toolCallCount = 0;
 		const unsubscribe = client.onEvent((event: any) => {
 			if (event.type === "tool_execution_start") {
-				ctx.ui.notify(`[Verify] Tool: ${event.toolName}`, "info");
+				toolCallCount++;
+				ctx.ui.notify(`[Verify] Tool (${toolCallCount}/${LIMITS.maxToolCallsPerSubAgent}): ${event.toolName}`, "info");
+				if (toolCallCount >= LIMITS.maxToolCallsPerSubAgent) {
+					ctx.ui.notify("[Verify] Tool call limit reached, aborting sub-agent", "warning");
+					client.abort().catch(() => {});
+				}
 			}
 			if (event.type === "tool_execution_end" && event.isError) {
 				ctx.ui.notify(`[Verify] Tool error: ${event.toolName}`, "warning");
@@ -847,7 +960,7 @@ ${JSON.stringify(finding, null, 2)}
 **Result output path:** ${verifyOutputPath}
 
 Verify this finding by re-reading the actual code, check for duplicates, and submit via gh issue create if valid. Write the result to the output path.`,
-				600_000,
+				LIMITS.verifyTimeoutMs,
 			);
 
 			// Save session reference
@@ -882,5 +995,57 @@ Verify this finding by re-reading the actual code, check for duplicates, and sub
 		// Remove processed finding from cache (always remove, whether submitted or rejected)
 		cache.shift();
 		atomicWriteJson(findingsCachePath, cache);
+	}
+
+	// ========================================================================
+	// Housekeeping
+	// ========================================================================
+
+	function cleanupOldSessions(): void {
+		try {
+			const sessions = readJson<SessionRecord[]>(sessionsPath, []);
+			const cutoff = Date.now() - LIMITS.sessionRetentionDays * 86400_000;
+			const kept: SessionRecord[] = [];
+
+			for (const record of sessions) {
+				if (new Date(record.timestamp).getTime() < cutoff) {
+					// Delete the actual session file
+					if (record.sessionFile) {
+						try {
+							unlinkSync(record.sessionFile);
+						} catch {
+							// File may already be deleted
+						}
+					}
+				} else {
+					kept.push(record);
+				}
+			}
+
+			if (kept.length !== sessions.length) {
+				atomicWriteJson(sessionsPath, kept);
+			}
+		} catch {
+			// Cleanup is best-effort
+		}
+	}
+
+	function trimReviewedFiles(repo: string): void {
+		try {
+			const reviewed = readJson<ReviewedFiles>(reviewedFilesPath, {});
+			const repoReviewed = reviewed[repo];
+			if (!repoReviewed) return;
+
+			const entries = Object.entries(repoReviewed);
+			if (entries.length <= LIMITS.maxReviewedFilesPerRepo) return;
+
+			// Sort by date, keep newest half
+			entries.sort(([, a], [, b]) => new Date(b).getTime() - new Date(a).getTime());
+			const keepCount = Math.floor(LIMITS.maxReviewedFilesPerRepo / 2);
+			reviewed[repo] = Object.fromEntries(entries.slice(0, keepCount));
+			atomicWriteJson(reviewedFilesPath, reviewed);
+		} catch {
+			// Trim is best-effort
+		}
 	}
 }
