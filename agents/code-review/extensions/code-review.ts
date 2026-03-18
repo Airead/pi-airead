@@ -1,7 +1,8 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, execSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // ============================================================================
 // Types
@@ -51,6 +52,7 @@ interface SessionRecord {
 class SubAgentClient {
 	private process: ChildProcess | null = null;
 	private eventListeners: Array<(event: any) => void> = [];
+	private exitListeners: Array<(code: number | null) => void> = [];
 	private pendingRequests = new Map<
 		string,
 		{ resolve: (res: any) => void; reject: (err: Error) => void; timer: ReturnType<typeof setTimeout> }
@@ -94,11 +96,14 @@ class SubAgentClient {
 		});
 
 		this.process.on("exit", (code) => {
-			for (const [id, pending] of this.pendingRequests) {
+			for (const [, pending] of this.pendingRequests) {
 				pending.reject(new Error(`Process exited with code ${code}`));
 				clearTimeout(pending.timer);
 			}
 			this.pendingRequests.clear();
+			for (const listener of this.exitListeners) {
+				listener(code);
+			}
 		});
 
 		await new Promise((resolve) => setTimeout(resolve, 200));
@@ -134,6 +139,14 @@ class SubAgentClient {
 		};
 	}
 
+	onExit(listener: (code: number | null) => void): () => void {
+		this.exitListeners.push(listener);
+		return () => {
+			const idx = this.exitListeners.indexOf(listener);
+			if (idx !== -1) this.exitListeners.splice(idx, 1);
+		};
+	}
+
 	getStderr(): string {
 		return this.stderr;
 	}
@@ -153,16 +166,30 @@ class SubAgentClient {
 
 	waitForIdle(timeout = 600_000): Promise<void> {
 		return new Promise((resolve, reject) => {
+			const cleanup = () => {
+				clearTimeout(timer);
+				unsubEvent();
+				unsubExit();
+			};
+
 			const timer = setTimeout(() => {
-				unsub();
+				cleanup();
 				reject(new Error(`Timeout waiting for agent idle after ${timeout}ms`));
 			}, timeout);
 
-			const unsub = this.onEvent((event) => {
+			const unsubEvent = this.onEvent((event) => {
 				if (event.type === "agent_end") {
-					clearTimeout(timer);
-					unsub();
+					cleanup();
 					resolve();
+				}
+			});
+
+			const unsubExit = this.onExit((code) => {
+				cleanup();
+				if (code === 0) {
+					resolve();
+				} else {
+					reject(new Error(`Sub-agent process exited with code ${code}`));
 				}
 			});
 		});
@@ -178,6 +205,13 @@ class SubAgentClient {
 		try {
 			const data = JSON.parse(line);
 
+			// Auto-respond to extension UI requests (permissions, confirmations)
+			// Sub-agents run autonomously — approve all tool usage
+			if (data.type === "extension_ui_request" && data.id) {
+				this.autoRespondToUIRequest(data);
+				return;
+			}
+
 			if (data.type === "response" && data.id && this.pendingRequests.has(data.id)) {
 				const pending = this.pendingRequests.get(data.id)!;
 				this.pendingRequests.delete(data.id);
@@ -192,6 +226,41 @@ class SubAgentClient {
 		} catch {
 			// Ignore non-JSON lines
 		}
+	}
+
+	private autoRespondToUIRequest(request: any): void {
+		if (!this.process?.stdin) return;
+
+		let response: any;
+		switch (request.method) {
+			case "confirm":
+				response = { type: "extension_ui_response", id: request.id, confirmed: true };
+				break;
+			case "select":
+				// Select first option if available
+				response = {
+					type: "extension_ui_response",
+					id: request.id,
+					value: request.options?.[0] ?? "",
+				};
+				break;
+			case "input":
+			case "editor":
+				response = { type: "extension_ui_response", id: request.id, value: "" };
+				break;
+			case "notify":
+			case "setStatus":
+			case "setWidget":
+			case "setTitle":
+				// No response needed for fire-and-forget UI methods
+				return;
+			default:
+				// Unknown method — cancel to avoid hanging
+				response = { type: "extension_ui_response", id: request.id, cancelled: true };
+				break;
+		}
+
+		this.process.stdin.write(JSON.stringify(response) + "\n");
 	}
 
 	private send(command: Record<string, unknown>): Promise<any> {
@@ -248,7 +317,8 @@ function readJson<T>(filePath: string, fallback: T): T {
 
 export default function codeReviewExtension(pi: ExtensionAPI): void {
 	// Resolve paths relative to this extension file
-	const extensionDir = dirname(dirname(__filename));
+	const currentFile = fileURLToPath(import.meta.url);
+	const extensionDir = dirname(dirname(currentFile));
 	const stateDir = join(extensionDir, "state");
 	const workspaceDir = join(extensionDir, "workspace");
 	const skillsDir = join(extensionDir, "skills");
@@ -472,7 +542,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 	// Repository Management
 	// ========================================================================
 
-	async function ensureRepo(repo: string, ctx: any): Promise<string | null> {
+	function ensureRepo(repo: string, ctx: any): string | null {
 		ensureDir(workspaceDir);
 		const repoName = repo.replace("/", "_");
 		const repoDir = join(workspaceDir, repoName);
@@ -480,7 +550,6 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 		try {
 			if (existsSync(join(repoDir, ".git"))) {
 				// Verify and pull
-				const { execSync } = await import("node:child_process");
 				try {
 					execSync("git status", { cwd: repoDir, stdio: "pipe" });
 					execSync("git pull --ff-only", { cwd: repoDir, stdio: "pipe", timeout: 60_000 });
@@ -494,7 +563,6 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			} else {
 				// Fresh clone
 				ctx.ui.notify(`Cloning repository: ${repo}`, "info");
-				const { execSync } = await import("node:child_process");
 				execSync(`gh repo clone ${repo} "${repoDir}"`, { stdio: "pipe", timeout: 300_000 });
 			}
 			return repoDir;
@@ -508,10 +576,8 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 	// File Selection
 	// ========================================================================
 
-	async function selectFile(repo: string, repoDir: string, forceFile?: string): Promise<string | undefined> {
+	function selectFile(repo: string, repoDir: string, forceFile?: string): string | undefined {
 		if (forceFile) return forceFile;
-
-		const { execSync } = await import("node:child_process");
 
 		// Get all tracked files
 		const output = execSync("git ls-files", { cwd: repoDir, encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 });
