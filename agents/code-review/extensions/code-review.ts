@@ -23,6 +23,7 @@ import {
 	readJson,
 	selectNextFile,
 	trimReviewedFiles,
+	validateRepo,
 } from "./code-review-utils.js";
 
 // ============================================================================
@@ -356,27 +357,36 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 		type: "string",
 	});
 
+	/** Returns repo+dataDir or shows errors and returns null. */
+	function requireFlags(ctx: any): { repo: string; dataDir: string } | null {
+		const repo = pi.getFlag("review-repo") as string | undefined;
+		if (!repo) {
+			ctx.ui.notify("Missing --review-repo flag", "error");
+			return null;
+		}
+		const dataDir = pi.getFlag("review-data-dir") as string | undefined;
+		if (!dataDir) {
+			ctx.ui.notify("Missing --review-data-dir flag", "error");
+			return null;
+		}
+		return { repo, dataDir };
+	}
+
 	// Register commands
 	pi.registerCommand("review-start", {
 		description: "Start the automated code review loop",
 		handler: async (_args, ctx) => {
-			const repo = pi.getFlag("review-repo") as string | undefined;
-			if (!repo) {
-				ctx.ui.notify("Missing --review-repo flag", "error");
-				return;
-			}
-			startReviewLoop(repo, ctx);
+			const flags = requireFlags(ctx);
+			if (!flags) return;
+			startReviewLoop(flags.repo, ctx);
 		},
 	});
 
 	pi.registerCommand("review-now", {
 		description: "Trigger an immediate review cycle",
 		handler: async (_args, ctx) => {
-			const repo = pi.getFlag("review-repo") as string | undefined;
-			if (!repo) {
-				ctx.ui.notify("Missing --review-repo flag", "error");
-				return;
-			}
+			const flags = requireFlags(ctx);
+			if (!flags) return;
 			if (isRunning) {
 				ctx.ui.notify("A review cycle is already running", "warning");
 				return;
@@ -387,7 +397,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				return;
 			}
 			const prevFailures = consecutiveFailures;
-			const didRun = await runCycle(repo, ctx);
+			const didRun = await runCycle(flags.repo, ctx);
 			if (didRun && (consecutiveFailures === prevFailures || consecutiveFailures === 0)) {
 				incrementDailyStatsLocal();
 			}
@@ -409,13 +419,10 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 	pi.registerCommand("review-status", {
 		description: "Show review progress",
 		handler: async (_args, ctx) => {
-			const repo = pi.getFlag("review-repo") as string | undefined;
-			if (!repo) {
-				ctx.ui.notify("Missing --review-repo flag", "error");
-				return;
-			}
+			const flags = requireFlags(ctx);
+			if (!flags) return;
 			const reviewed = readJson<ReviewedFiles>(statePath("reviewed-files.json"), {});
-			const repoReviewed = reviewed[repo] ?? {};
+			const repoReviewed = reviewed[flags.repo] ?? {};
 			const count = Object.keys(repoReviewed).length;
 			const cache = readJson<Finding[]>(statePath("findings-cache.json"), []);
 			const cycle = readJson<CycleState>(statePath("cycle.json"), { status: "idle" });
@@ -423,7 +430,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			const stats = readJson<DailyStats>(statePath("daily-stats.json"), { date: today, cycleCount: 0 });
 			const todayCycles = stats.date === today ? stats.cycleCount : 0;
 			ctx.ui.notify(
-				`Repo: ${repo} | Reviewed: ${count} files | Cached findings: ${cache.length} | Cycle: ${cycle.status} | Loop: ${loopActive ? "active" : "stopped"} | Today: ${todayCycles}/${LIMITS.maxCyclesPerDay} cycles | Failures: ${consecutiveFailures}`,
+				`Repo: ${flags.repo} | Reviewed: ${count} files | Cached findings: ${cache.length} | Cycle: ${cycle.status} | Loop: ${loopActive ? "active" : "stopped"} | Today: ${todayCycles}/${LIMITS.maxCyclesPerDay} cycles | Failures: ${consecutiveFailures}`,
 				"info",
 			);
 		},
@@ -432,24 +439,22 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 	pi.registerCommand("review-reset", {
 		description: "Reset reviewed files list for current repo",
 		handler: async (_args, ctx) => {
-			const repo = pi.getFlag("review-repo") as string | undefined;
-			if (!repo) {
-				ctx.ui.notify("Missing --review-repo flag", "error");
-				return;
-			}
+			const flags = requireFlags(ctx);
+			if (!flags) return;
 			const p = statePath("reviewed-files.json");
 			assertStateWrite(p);
 			const reviewed = readJson<ReviewedFiles>(p, {});
-			delete reviewed[repo];
+			delete reviewed[flags.repo];
 			atomicWriteJson(p, reviewed);
-			ctx.ui.notify(`Reset reviewed files for ${repo}`, "info");
+			ctx.ui.notify(`Reset reviewed files for ${flags.repo}`, "info");
 		},
 	});
 
-	// Auto-start on session_start if --review-repo is provided
+	// Auto-start on session_start if required flags are provided (silent skip if missing)
 	pi.on("session_start", async (_event, ctx) => {
 		const repo = pi.getFlag("review-repo") as string | undefined;
-		if (repo) {
+		const dataDir = pi.getFlag("review-data-dir") as string | undefined;
+		if (repo && dataDir) {
 			ctx.ui.notify(`Code review agent starting for ${repo}`, "info");
 			startReviewLoop(repo, ctx);
 		}
@@ -550,6 +555,9 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 	/** Returns true if cycle actually ran, false if skipped (e.g., already running) */
 	async function runCycle(repo: string, ctx: any): Promise<boolean> {
 		if (isRunning) return false;
+		if (!validateRepo(repo)) {
+			throw new Error(`Invalid repo format: ${repo}. Expected: owner/repo`);
+		}
 		isRunning = true;
 
 		try {
@@ -564,7 +572,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				await runVerifyRound(repo, ctx);
 				finishCycle(repo, prevCycle.file);
 				consecutiveFailures = 0;
-				cleanupOldSessions(statePath("sessions.json"), LIMITS.sessionRetentionDays, [getStateDir()]);
+				cleanupOldSessions(statePath("sessions.json"), LIMITS.sessionRetentionDays);
 				trimReviewedFiles(statePath("reviewed-files.json"), repo, LIMITS.maxReviewedFilesPerRepo);
 				return true;
 			}
@@ -602,7 +610,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			consecutiveFailures = 0;
 
 			// Housekeeping after successful cycle
-			cleanupOldSessions(statePath("sessions.json"), LIMITS.sessionRetentionDays, [getStateDir()]);
+			cleanupOldSessions(statePath("sessions.json"), LIMITS.sessionRetentionDays);
 			trimReviewedFiles(statePath("reviewed-files.json"), repo, LIMITS.maxReviewedFilesPerRepo);
 			return true;
 		} catch (err: any) {

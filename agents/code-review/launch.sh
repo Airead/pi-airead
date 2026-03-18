@@ -29,13 +29,23 @@ EOF
     exit "${1:-0}"
 }
 
+require_arg() {
+    if [ $# -lt 2 ] || [[ "$2" == --* ]]; then
+        echo "Error: $1 requires a value"
+        exit 1
+    fi
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --repo)
+            require_arg "$@"
             REPO="$2"; shift 2 ;;
         --data-dir)
+            require_arg "$@"
             DATA_DIR="$2"; shift 2 ;;
         --interval)
+            require_arg "$@"
             INTERVAL="$2"; shift 2 ;;
         --help|-h)
             usage 0 ;;
@@ -54,6 +64,10 @@ if [ -z "$DATA_DIR" ]; then
     echo "Error: --data-dir is required"
     usage 1
 fi
+
+# Resolve to absolute path before any cd
+mkdir -p "$DATA_DIR"
+DATA_DIR="$(cd "$DATA_DIR" && pwd)"
 
 # Validate repo format: owner/repo
 if ! echo "$REPO" | grep -qE '^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$'; then
