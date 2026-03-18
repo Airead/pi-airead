@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
-import { existsSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -10,6 +10,7 @@ import {
 	type ReviewedFiles,
 	type SessionRecord,
 	type VerifyResult,
+	assertPathAllowed,
 	atomicWriteJson,
 	checkSafetyGates,
 	cleanupOldSessions,
@@ -22,7 +23,6 @@ import {
 	readJson,
 	selectNextFile,
 	trimReviewedFiles,
-	validateRepo,
 } from "./code-review-utils.js";
 
 // ============================================================================
@@ -44,8 +44,6 @@ export const LIMITS = {
 	sessionRetentionDays: 7,
 	/** Max entries in reviewed-files per repo */
 	maxReviewedFilesPerRepo: 5000,
-	/** Max repo size in MB (refuse to clone larger repos) */
-	maxRepoSizeMb: 500,
 } as const;
 
 // ============================================================================
@@ -314,17 +312,31 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 	const currentFile =
 		typeof __filename !== "undefined" ? __filename : fileURLToPath(import.meta.url);
 	const extensionDir = dirname(dirname(currentFile));
-	const stateDir = join(extensionDir, "state");
-	const workspaceDir = join(extensionDir, "workspace");
 	const skillsDir = join(extensionDir, "skills");
 
-	const cycleStatePath = join(stateDir, "cycle.json");
-	const reviewedFilesPath = join(stateDir, "reviewed-files.json");
-	const findingsCachePath = join(stateDir, "findings-cache.json");
-	const sessionsPath = join(stateDir, "sessions.json");
-	const findingsOutputPath = join(stateDir, "pending-findings.json");
-	const verifyOutputPath = join(stateDir, "verify-result.json");
-	const dailyStatsPath = join(stateDir, "daily-stats.json");
+	// State dir is lazily resolved from --review-data-dir flag
+	let _stateDir: string | null = null;
+	function getStateDir(): string {
+		if (!_stateDir) {
+			const dataDir = pi.getFlag("review-data-dir") as string | undefined;
+			if (!dataDir) throw new Error("Missing required --review-data-dir flag");
+			_stateDir = join(dataDir, "state");
+			ensureDir(_stateDir);
+		}
+		return _stateDir;
+	}
+
+	function statePath(name: string): string {
+		return join(getStateDir(), name);
+	}
+
+	/** Assert a path is inside stateDir before writing. */
+	function assertStateWrite(targetPath: string): void {
+		assertPathAllowed(targetPath, [getStateDir()]);
+	}
+
+	// repoDir = cwd (launch.sh already cd'd into the target repo)
+	const repoDir = process.cwd();
 
 	// Detect pi CLI entry point for spawning sub-agents
 	const piCliPath = process.argv[1];
@@ -338,6 +350,10 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 		description: "Interval between review cycles in hours (default: 1)",
 		type: "string",
 		default: "1",
+	});
+	pi.registerFlag("review-data-dir", {
+		description: "Directory for runtime data (state/ and workspace/)",
+		type: "string",
 	});
 
 	// Register commands
@@ -398,13 +414,13 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify("Missing --review-repo flag", "error");
 				return;
 			}
-			const reviewed = readJson<ReviewedFiles>(reviewedFilesPath, {});
+			const reviewed = readJson<ReviewedFiles>(statePath("reviewed-files.json"), {});
 			const repoReviewed = reviewed[repo] ?? {};
 			const count = Object.keys(repoReviewed).length;
-			const cache = readJson<Finding[]>(findingsCachePath, []);
-			const cycle = readJson<CycleState>(cycleStatePath, { status: "idle" });
+			const cache = readJson<Finding[]>(statePath("findings-cache.json"), []);
+			const cycle = readJson<CycleState>(statePath("cycle.json"), { status: "idle" });
 			const today = new Date().toISOString().slice(0, 10);
-			const stats = readJson<DailyStats>(dailyStatsPath, { date: today, cycleCount: 0 });
+			const stats = readJson<DailyStats>(statePath("daily-stats.json"), { date: today, cycleCount: 0 });
 			const todayCycles = stats.date === today ? stats.cycleCount : 0;
 			ctx.ui.notify(
 				`Repo: ${repo} | Reviewed: ${count} files | Cached findings: ${cache.length} | Cycle: ${cycle.status} | Loop: ${loopActive ? "active" : "stopped"} | Today: ${todayCycles}/${LIMITS.maxCyclesPerDay} cycles | Failures: ${consecutiveFailures}`,
@@ -421,9 +437,11 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify("Missing --review-repo flag", "error");
 				return;
 			}
-			const reviewed = readJson<ReviewedFiles>(reviewedFilesPath, {});
+			const p = statePath("reviewed-files.json");
+			assertStateWrite(p);
+			const reviewed = readJson<ReviewedFiles>(p, {});
 			delete reviewed[repo];
-			atomicWriteJson(reviewedFilesPath, reviewed);
+			atomicWriteJson(p, reviewed);
 			ctx.ui.notify(`Reset reviewed files for ${repo}`, "info");
 		},
 	});
@@ -448,15 +466,17 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 
 	function checkSafetyGatesLocal(): string | null {
 		const today = new Date().toISOString().slice(0, 10);
-		const stats = readJson<DailyStats>(dailyStatsPath, { date: today, cycleCount: 0 });
+		const stats = readJson<DailyStats>(statePath("daily-stats.json"), { date: today, cycleCount: 0 });
 		return checkSafetyGates(consecutiveFailures, stats, today, LIMITS);
 	}
 
 	function incrementDailyStatsLocal(): void {
 		const today = new Date().toISOString().slice(0, 10);
-		const stats = readJson<DailyStats>(dailyStatsPath, { date: today, cycleCount: 0 });
+		const p = statePath("daily-stats.json");
+		assertStateWrite(p);
+		const stats = readJson<DailyStats>(p, { date: today, cycleCount: 0 });
 		const updated = incrementDailyStats(stats, today);
-		atomicWriteJson(dailyStatsPath, updated);
+		atomicWriteJson(p, updated);
 	}
 
 	function startReviewLoop(repo: string, ctx: any): void {
@@ -536,7 +556,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			ctx.ui.setStatus("code-review", undefined); // Clear previous status
 
 			// Check for incomplete cycle from crash recovery
-			const prevCycle = readJson<CycleState>(cycleStatePath, { status: "idle" });
+			const prevCycle = readJson<CycleState>(statePath("cycle.json"), { status: "idle" });
 
 			if (prevCycle.status === "verifying" && prevCycle.file) {
 				// Resume from verification
@@ -544,8 +564,8 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				await runVerifyRound(repo, ctx);
 				finishCycle(repo, prevCycle.file);
 				consecutiveFailures = 0;
-				cleanupOldSessions(sessionsPath, LIMITS.sessionRetentionDays);
-				trimReviewedFiles(reviewedFilesPath, repo, LIMITS.maxReviewedFilesPerRepo);
+				cleanupOldSessions(statePath("sessions.json"), LIMITS.sessionRetentionDays, [getStateDir()]);
+				trimReviewedFiles(statePath("reviewed-files.json"), repo, LIMITS.maxReviewedFilesPerRepo);
 				return true;
 			}
 
@@ -554,15 +574,8 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify(`Recovering: restarting review for ${prevCycle.file}`, "info");
 			}
 
-			// Step 1: Clone or pull
-			updateCycleState({ status: "cloning", repo, startedAt: new Date().toISOString() });
-			const repoDir = ensureRepo(repo, ctx);
-			if (!repoDir) {
-				throw new Error("Failed to clone or update repository");
-			}
-
-			// Step 2: Select file
-			const file = selectFile(repo, repoDir, prevCycle.status !== "idle" ? prevCycle.file : undefined);
+			// Step 1: Select file
+			const file = selectFile(repo, prevCycle.status !== "idle" ? prevCycle.file : undefined);
 			if (!file) {
 				// All files reviewed is not a failure — just skip this cycle without penalizing
 				updateCycleState({ status: "idle" });
@@ -571,12 +584,12 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 
 			ctx.ui.notify(`Reviewing: ${file}`, "info");
 
-			// Step 3: Review round
+			// Step 2: Review round
 			updateCycleState({ status: "reviewing", file, repo, startedAt: new Date().toISOString() });
-			await runReviewRound(repo, repoDir, file, ctx);
+			await runReviewRound(repo, file, ctx);
 
-			// Step 4: Verify round (if there are findings in cache)
-			const cache = readJson<Finding[]>(findingsCachePath, []);
+			// Step 3: Verify round (if there are findings in cache)
+			const cache = readJson<Finding[]>(statePath("findings-cache.json"), []);
 			if (cache.length > 0) {
 				updateCycleState({ status: "verifying", file, repo, startedAt: new Date().toISOString() });
 				await runVerifyRound(repo, ctx);
@@ -584,13 +597,13 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify("No findings to verify", "info");
 			}
 
-			// Step 5: Finish
+			// Step 4: Finish
 			finishCycle(repo, file);
 			consecutiveFailures = 0;
 
 			// Housekeeping after successful cycle
-			cleanupOldSessions(sessionsPath, LIMITS.sessionRetentionDays);
-			trimReviewedFiles(reviewedFilesPath, repo, LIMITS.maxReviewedFilesPerRepo);
+			cleanupOldSessions(statePath("sessions.json"), LIMITS.sessionRetentionDays, [getStateDir()]);
+			trimReviewedFiles(statePath("reviewed-files.json"), repo, LIMITS.maxReviewedFilesPerRepo);
 			return true;
 		} catch (err: any) {
 			consecutiveFailures++;
@@ -607,90 +620,27 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 
 	function finishCycle(repo: string, file: string): void {
 		// Mark file as reviewed
-		const reviewed = readJson<ReviewedFiles>(reviewedFilesPath, {});
+		const p = statePath("reviewed-files.json");
+		assertStateWrite(p);
+		const reviewed = readJson<ReviewedFiles>(p, {});
 		if (!reviewed[repo]) reviewed[repo] = {};
 		reviewed[repo][file] = new Date().toISOString();
-		atomicWriteJson(reviewedFilesPath, reviewed);
+		atomicWriteJson(p, reviewed);
 
 		updateCycleState({ status: "idle" });
 	}
 
 	function updateCycleState(state: CycleState): void {
-		atomicWriteJson(cycleStatePath, state);
-	}
-
-	// ========================================================================
-	// Repository Management
-	// ========================================================================
-
-	/** Returns true if repo exceeds size limit. Best-effort (returns false on API failure). */
-	function isRepoTooLarge(repo: string, ctx: any): boolean {
-		try {
-			const repoInfo = execFileSync("gh", ["api", `repos/${repo}`, "--jq", ".size"], {
-				encoding: "utf-8",
-				stdio: ["pipe", "pipe", "pipe"],
-				timeout: 15_000,
-			}).trim();
-			const sizeKb = parseInt(repoInfo, 10);
-			if (!isNaN(sizeKb) && sizeKb / 1024 > LIMITS.maxRepoSizeMb) {
-				ctx.ui.notify(
-					`Repository ${repo} is ${(sizeKb / 1024).toFixed(0)}MB, exceeds ${LIMITS.maxRepoSizeMb}MB limit. Skipping.`,
-					"error",
-				);
-				return true;
-			}
-		} catch {
-			// Size check is best-effort
-		}
-		return false;
-	}
-
-	function cloneRepo(repo: string, repoDir: string): void {
-		execFileSync("gh", ["repo", "clone", repo, repoDir], { stdio: "pipe", timeout: 300_000 });
-	}
-
-	function ensureRepo(repo: string, ctx: any): string | null {
-		if (!validateRepo(repo)) {
-			ctx.ui.notify(`Invalid repo format: ${repo}. Expected: owner/repo`, "error");
-			return null;
-		}
-
-		ensureDir(workspaceDir);
-		const repoName = repo.replace("/", "_");
-		const repoDir = join(workspaceDir, repoName);
-
-		try {
-			if (existsSync(join(repoDir, ".git"))) {
-				// Verify and pull
-				try {
-					execFileSync("git", ["status"], { cwd: repoDir, stdio: "pipe" });
-					execFileSync("git", ["pull", "--ff-only"], { cwd: repoDir, stdio: "pipe", timeout: 60_000 });
-					ctx.ui.notify(`Repository updated: ${repo}`, "info");
-				} catch {
-					// Broken repo — check size before re-clone
-					ctx.ui.notify(`Repository broken, re-cloning: ${repo}`, "warning");
-					execFileSync("rm", ["-rf", repoDir], { stdio: "pipe" });
-					if (isRepoTooLarge(repo, ctx)) return null;
-					cloneRepo(repo, repoDir);
-				}
-			} else {
-				// Fresh clone — check size first
-				if (isRepoTooLarge(repo, ctx)) return null;
-				ctx.ui.notify(`Cloning repository: ${repo}`, "info");
-				cloneRepo(repo, repoDir);
-			}
-			return repoDir;
-		} catch (err: any) {
-			ctx.ui.notify(`Failed to clone/update repo: ${err.message}`, "error");
-			return null;
-		}
+		const p = statePath("cycle.json");
+		assertStateWrite(p);
+		atomicWriteJson(p, state);
 	}
 
 	// ========================================================================
 	// File Selection
 	// ========================================================================
 
-	function selectFile(repo: string, repoDir: string, forceFile?: string): string | undefined {
+	function selectFile(repo: string, forceFile?: string): string | undefined {
 		if (forceFile) return forceFile;
 
 		// Get all tracked files
@@ -700,14 +650,16 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			.filter(Boolean)
 			.filter((f) => isCodeFile(f));
 
-		const reviewed = readJson<ReviewedFiles>(reviewedFilesPath, {});
+		const reviewed = readJson<ReviewedFiles>(statePath("reviewed-files.json"), {});
 		const repoReviewed = reviewed[repo] ?? {};
 		const { file, updatedReviewed } = selectNextFile(allFiles, repoReviewed);
 
 		// Persist if reviewed map was modified (oldest-half reset)
 		if (Object.keys(updatedReviewed).length !== Object.keys(repoReviewed).length) {
+			const p = statePath("reviewed-files.json");
+			assertStateWrite(p);
 			reviewed[repo] = updatedReviewed;
-			atomicWriteJson(reviewedFilesPath, reviewed);
+			atomicWriteJson(p, reviewed);
 		}
 
 		return file;
@@ -717,10 +669,12 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 	// Round 1: Review
 	// ========================================================================
 
-	async function runReviewRound(repo: string, repoDir: string, file: string, ctx: any): Promise<void> {
+	async function runReviewRound(repo: string, file: string, ctx: any): Promise<void> {
 		// Clean previous output
+		const pendingPath = statePath("pending-findings.json");
+		assertStateWrite(pendingPath);
 		try {
-			writeFileSync(findingsOutputPath, "[]", "utf-8");
+			writeFileSync(pendingPath, "[]", "utf-8");
 		} catch {
 			// Ignore
 		}
@@ -755,7 +709,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 Use the "review" skill to guide your review process. Read the skill file to get detailed instructions.
 
 **Target file:** ${file}
-**Findings output path:** ${findingsOutputPath}
+**Findings output path:** ${statePath("pending-findings.json")}
 
 Review the file thoroughly and write your findings as a JSON array to the output path.`,
 				LIMITS.reviewTimeoutMs,
@@ -764,7 +718,9 @@ Review the file thoroughly and write your findings as a JSON array to the output
 			// Save session reference
 			try {
 				const state = await client.getState();
-				const sessions = readJson<SessionRecord[]>(sessionsPath, []);
+				const sp = statePath("sessions.json");
+				assertStateWrite(sp);
+				const sessions = readJson<SessionRecord[]>(sp, []);
 				sessions.push({
 					timestamp: new Date().toISOString(),
 					type: "review",
@@ -773,7 +729,7 @@ Review the file thoroughly and write your findings as a JSON array to the output
 				});
 				// Keep last 100 session records
 				if (sessions.length > 100) sessions.splice(0, sessions.length - 100);
-				atomicWriteJson(sessionsPath, sessions);
+				atomicWriteJson(sp, sessions);
 			} catch {
 				// Session save is best-effort
 			}
@@ -783,7 +739,7 @@ Review the file thoroughly and write your findings as a JSON array to the output
 		}
 
 		// Merge new findings into cache (validate sub-agent output)
-		const rawFindings = readJson<unknown[]>(findingsOutputPath, []);
+		const rawFindings = readJson<unknown[]>(statePath("pending-findings.json"), []);
 		const newFindings = filterValidFindings(rawFindings);
 		const discarded = rawFindings.length - newFindings.length;
 		if (discarded > 0) {
@@ -798,7 +754,9 @@ Review the file thoroughly and write your findings as a JSON array to the output
 	}
 
 	function mergeFindingsCache(newFindings: Finding[]): void {
-		mergeFindingsIntoCache(findingsCachePath, newFindings, 10);
+		const p = statePath("findings-cache.json");
+		assertStateWrite(p);
+		mergeFindingsIntoCache(p, newFindings, 10);
 	}
 
 	// ========================================================================
@@ -806,7 +764,7 @@ Review the file thoroughly and write your findings as a JSON array to the output
 	// ========================================================================
 
 	async function runVerifyRound(repo: string, ctx: any): Promise<void> {
-		const cache = readJson<Finding[]>(findingsCachePath, []);
+		const cache = readJson<Finding[]>(statePath("findings-cache.json"), []);
 		if (cache.length === 0) return;
 
 		// Take the top finding
@@ -814,14 +772,14 @@ Review the file thoroughly and write your findings as a JSON array to the output
 		ctx.ui.notify(`[Verify] Checking: ${finding.title} (${finding.file}:${finding.line})`, "info");
 
 		// Clean previous output
+		const verifyPath = statePath("verify-result.json");
+		assertStateWrite(verifyPath);
 		try {
-			writeFileSync(verifyOutputPath, "{}", "utf-8");
+			writeFileSync(verifyPath, "{}", "utf-8");
 		} catch {
 			// Ignore
 		}
 
-		const repoName = repo.replace("/", "_");
-		const repoDir = join(workspaceDir, repoName);
 		const verifySkillPath = join(skillsDir, "verify");
 
 		const client = new SubAgentClient(piCliPath, {
@@ -856,7 +814,7 @@ Use the "verify" skill to guide your verification process. Read the skill file t
 \`\`\`json
 ${JSON.stringify(finding, null, 2)}
 \`\`\`
-**Result output path:** ${verifyOutputPath}
+**Result output path:** ${statePath("verify-result.json")}
 
 Verify this finding by re-reading the actual code, check for duplicates, and submit via gh issue create if valid. Write the result to the output path.`,
 				LIMITS.verifyTimeoutMs,
@@ -865,7 +823,9 @@ Verify this finding by re-reading the actual code, check for duplicates, and sub
 			// Save session reference
 			try {
 				const state = await client.getState();
-				const sessions = readJson<SessionRecord[]>(sessionsPath, []);
+				const sp = statePath("sessions.json");
+				assertStateWrite(sp);
+				const sessions = readJson<SessionRecord[]>(sp, []);
 				sessions.push({
 					timestamp: new Date().toISOString(),
 					type: "verify",
@@ -873,7 +833,7 @@ Verify this finding by re-reading the actual code, check for duplicates, and sub
 					sessionFile: state.sessionFile,
 				});
 				if (sessions.length > 100) sessions.splice(0, sessions.length - 100);
-				atomicWriteJson(sessionsPath, sessions);
+				atomicWriteJson(sp, sessions);
 			} catch {
 				// Session save is best-effort
 			}
@@ -883,7 +843,7 @@ Verify this finding by re-reading the actual code, check for duplicates, and sub
 		}
 
 		// Process result
-		const result = readJson<VerifyResult>(verifyOutputPath, { status: "rejected", reason: "No output", finding });
+		const result = readJson<VerifyResult>(statePath("verify-result.json"), { status: "rejected", reason: "No output", finding });
 
 		if (result.status === "submitted") {
 			ctx.ui.notify(`[Verify] Issue submitted: ${result.issueUrl ?? "unknown URL"}`, "info");
@@ -892,8 +852,10 @@ Verify this finding by re-reading the actual code, check for duplicates, and sub
 		}
 
 		// Remove processed finding from cache (always remove, whether submitted or rejected)
+		const cp = statePath("findings-cache.json");
+		assertStateWrite(cp);
 		cache.shift();
-		atomicWriteJson(findingsCachePath, cache);
+		atomicWriteJson(cp, cache);
 	}
 
 	// ========================================================================

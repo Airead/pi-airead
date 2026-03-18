@@ -7,6 +7,7 @@ import {
 	type Finding,
 	type ReviewedFiles,
 	type SessionRecord,
+	assertPathAllowed,
 	atomicWriteJson,
 	checkSafetyGates,
 	cleanupOldSessions,
@@ -129,6 +130,41 @@ describe("ensureDir", () => {
 		const dir = join(testDir, "existing");
 		mkdirSync(dir);
 		expect(() => ensureDir(dir)).not.toThrow();
+	});
+});
+
+// ============================================================================
+// assertPathAllowed
+// ============================================================================
+
+describe("assertPathAllowed", () => {
+	it("allows path inside a root", () => {
+		expect(() => assertPathAllowed("/data/state/cycle.json", ["/data"])).not.toThrow();
+	});
+
+	it("allows exact root path", () => {
+		expect(() => assertPathAllowed("/data", ["/data"])).not.toThrow();
+	});
+
+	it("rejects path outside all roots", () => {
+		expect(() => assertPathAllowed("/etc/passwd", ["/data"])).toThrow("outside allowed roots");
+	});
+
+	it("rejects .. traversal escaping root", () => {
+		expect(() => assertPathAllowed("/data/../etc/passwd", ["/data"])).toThrow("outside allowed roots");
+	});
+
+	it("rejects prefix confusion (e.g. /data-evil vs /data)", () => {
+		expect(() => assertPathAllowed("/data-evil/file.json", ["/data"])).toThrow("outside allowed roots");
+	});
+
+	it("allows path with multiple roots", () => {
+		expect(() => assertPathAllowed("/cache/file.json", ["/data", "/cache"])).not.toThrow();
+	});
+
+	it("resolves relative paths before checking", () => {
+		// A relative path gets resolved to cwd — should not match /data unless cwd is under /data
+		expect(() => assertPathAllowed("relative/file.json", ["/data"])).toThrow("outside allowed roots");
 	});
 });
 
@@ -316,6 +352,41 @@ describe("cleanupOldSessions", () => {
 		// Should not throw even though the session file doesn't exist
 		const deleted = cleanupOldSessions(sessionsPath, 7);
 		expect(deleted).toBe(1);
+	});
+
+	it("skips file deletion when sessionFile is outside allowedDeleteRoots", () => {
+		const sessionsPath = join(testDir, "sessions.json");
+		const oldDate = new Date(Date.now() - 10 * 86400_000).toISOString();
+		const sessionFile = join(testDir, "safe.jsonl");
+		writeFileSync(sessionFile, "{}");
+
+		atomicWriteJson(sessionsPath, [
+			{ timestamp: oldDate, type: "review", file: "a.ts", sessionFile },
+		]);
+
+		// Use a root that does NOT contain testDir
+		const deleted = cleanupOldSessions(sessionsPath, 7, ["/nonexistent-root"]);
+		expect(deleted).toBe(1);
+
+		// File should NOT have been deleted (path outside allowed roots)
+		expect(readFileSync(sessionFile, "utf-8")).toBe("{}");
+	});
+
+	it("deletes file when sessionFile is inside allowedDeleteRoots", () => {
+		const sessionsPath = join(testDir, "sessions.json");
+		const oldDate = new Date(Date.now() - 10 * 86400_000).toISOString();
+		const sessionFile = join(testDir, "deletable.jsonl");
+		writeFileSync(sessionFile, "{}");
+
+		atomicWriteJson(sessionsPath, [
+			{ timestamp: oldDate, type: "review", file: "b.ts", sessionFile },
+		]);
+
+		const deleted = cleanupOldSessions(sessionsPath, 7, [testDir]);
+		expect(deleted).toBe(1);
+
+		// File should have been deleted
+		expect(() => readFileSync(sessionFile)).toThrow();
 	});
 });
 

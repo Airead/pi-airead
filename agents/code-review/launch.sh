@@ -2,26 +2,69 @@
 set -euo pipefail
 
 # Code Review Agent Launcher
-# Usage: ./launch.sh <owner/repo> [interval_hours]
-#
-# Examples:
-#   ./launch.sh facebook/react          # Review every 1 hour (default)
-#   ./launch.sh facebook/react 2        # Review every 2 hours
+# Usage: ./launch.sh --repo <owner/repo> --data-dir <path> [--interval <hours>]
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Validate arguments
-if [ $# -lt 1 ]; then
-    echo "Usage: $0 <owner/repo> [interval_hours]"
-    echo "  owner/repo      GitHub repository to review (e.g., facebook/react)"
-    echo "  interval_hours   Hours between review cycles (default: 1)"
+# --------------------------------------------------------------------------
+# Parse arguments
+# --------------------------------------------------------------------------
+
+REPO=""
+DATA_DIR=""
+INTERVAL="1"
+
+usage() {
+    cat <<EOF
+Usage: $0 --repo <owner/repo> --data-dir <path> [--interval <hours>]
+
+Required:
+  --repo <owner/repo>    GitHub repository to review (e.g., facebook/react)
+  --data-dir <path>      Directory for runtime data (state/ and workspace/)
+
+Optional:
+  --interval <hours>     Hours between review cycles (default: 1)
+  --help                 Show this help message
+EOF
+    exit "${1:-0}"
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --repo)
+            REPO="$2"; shift 2 ;;
+        --data-dir)
+            DATA_DIR="$2"; shift 2 ;;
+        --interval)
+            INTERVAL="$2"; shift 2 ;;
+        --help|-h)
+            usage 0 ;;
+        *)
+            echo "Error: Unknown argument: $1"
+            usage 1 ;;
+    esac
+done
+
+if [ -z "$REPO" ]; then
+    echo "Error: --repo is required"
+    usage 1
+fi
+
+if [ -z "$DATA_DIR" ]; then
+    echo "Error: --data-dir is required"
+    usage 1
+fi
+
+# Validate repo format: owner/repo
+if ! echo "$REPO" | grep -qE '^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$'; then
+    echo "Error: Invalid repo format '$REPO'. Expected: owner/repo"
     exit 1
 fi
 
-REPO="$1"
-INTERVAL="${2:-1}"
-
+# --------------------------------------------------------------------------
 # Check prerequisites
+# --------------------------------------------------------------------------
+
 echo "Checking prerequisites..."
 
 if ! command -v pi &>/dev/null; then
@@ -39,20 +82,69 @@ if ! gh auth status &>/dev/null; then
     exit 1
 fi
 
-# Ensure state directory exists
-mkdir -p "$SCRIPT_DIR/state"
-mkdir -p "$SCRIPT_DIR/workspace"
+# --------------------------------------------------------------------------
+# Prepare directories
+# --------------------------------------------------------------------------
 
+STATE_DIR="$DATA_DIR/state"
+WORKSPACE_DIR="$DATA_DIR/workspace"
+REPO_NAME="${REPO//\//_}"
+REPO_DIR="$WORKSPACE_DIR/$REPO_NAME"
+MAX_REPO_SIZE_MB=500
+
+mkdir -p "$STATE_DIR"
+mkdir -p "$WORKSPACE_DIR"
+
+# --------------------------------------------------------------------------
+# Clone or update repository
+# --------------------------------------------------------------------------
+
+repo_size_ok() {
+    local size_kb
+    size_kb="$(gh api "repos/$REPO" --jq '.size' 2>/dev/null || echo "")"
+    if [ -n "$size_kb" ]; then
+        local size_mb=$(( size_kb / 1024 ))
+        if [ "$size_mb" -gt "$MAX_REPO_SIZE_MB" ]; then
+            echo "Error: Repository $REPO is ${size_mb}MB, exceeds ${MAX_REPO_SIZE_MB}MB limit."
+            return 1
+        fi
+    fi
+    return 0
+}
+
+if [ -d "$REPO_DIR/.git" ]; then
+    echo "Updating repository: $REPO"
+    if ! (cd "$REPO_DIR" && git status &>/dev/null && git pull --ff-only 2>/dev/null); then
+        echo "Repository broken, re-cloning: $REPO"
+        rm -rf "$REPO_DIR"
+        repo_size_ok || exit 1
+        gh repo clone "$REPO" "$REPO_DIR"
+    fi
+else
+    repo_size_ok || exit 1
+    echo "Cloning repository: $REPO"
+    gh repo clone "$REPO" "$REPO_DIR"
+fi
+
+# --------------------------------------------------------------------------
+# Launch pi inside the repo directory
+# --------------------------------------------------------------------------
+
+echo ""
 echo "Starting code review agent..."
 echo "  Repository:  $REPO"
+echo "  Data dir:    $DATA_DIR"
 echo "  Interval:    ${INTERVAL} hour(s)"
-echo "  Skills:      $SCRIPT_DIR/skills/review, $SCRIPT_DIR/skills/verify"
 echo ""
 
-# Launch pi with the code review extension and skills
+cd "$REPO_DIR"
+
 exec pi \
+    --system-prompt "$SCRIPT_DIR/prompts/system.md" \
+    --append-system-prompt "$SCRIPT_DIR/prompts/agents.md" \
     -e "$SCRIPT_DIR/extensions/code-review.ts" \
     --skill "$SCRIPT_DIR/skills/review" \
     --skill "$SCRIPT_DIR/skills/verify" \
     --review-repo "$REPO" \
-    --review-interval "$INTERVAL"
+    --review-interval "$INTERVAL" \
+    --review-data-dir "$DATA_DIR"

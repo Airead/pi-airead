@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
 
 // ============================================================================
 // Types
@@ -18,7 +18,7 @@ export interface Finding {
 }
 
 export interface CycleState {
-	status: "idle" | "cloning" | "reviewing" | "verifying";
+	status: "idle" | "reviewing" | "verifying";
 	file?: string;
 	repo?: string;
 	startedAt?: string;
@@ -67,6 +67,22 @@ export function readJson<T>(filePath: string, fallback: T): T {
 		return JSON.parse(readFileSync(filePath, "utf-8")) as T;
 	} catch {
 		return fallback;
+	}
+}
+
+// ============================================================================
+// Path Safety
+// ============================================================================
+
+/** Throws if targetPath is not inside one of the allowedRoots after resolution. */
+export function assertPathAllowed(targetPath: string, allowedRoots: string[]): void {
+	const resolved = resolve(targetPath);
+	const allowed = allowedRoots.some((root) => {
+		const normalizedRoot = resolve(root);
+		return resolved === normalizedRoot || resolved.startsWith(normalizedRoot + "/");
+	});
+	if (!allowed) {
+		throw new Error(`Path "${resolved}" is outside allowed roots: ${allowedRoots.join(", ")}`);
 	}
 }
 
@@ -234,7 +250,7 @@ export function mergeFindingsIntoCache(
 // Housekeeping
 // ============================================================================
 
-export function cleanupOldSessions(sessionsPath: string, retentionDays: number): number {
+export function cleanupOldSessions(sessionsPath: string, retentionDays: number, allowedDeleteRoots?: string[]): number {
 	try {
 		const sessions = readJson<SessionRecord[]>(sessionsPath, []);
 		const cutoff = Date.now() - retentionDays * 86400_000;
@@ -244,6 +260,15 @@ export function cleanupOldSessions(sessionsPath: string, retentionDays: number):
 		for (const record of sessions) {
 			if (new Date(record.timestamp).getTime() < cutoff) {
 				if (record.sessionFile) {
+					if (allowedDeleteRoots) {
+						try {
+							assertPathAllowed(record.sessionFile, allowedDeleteRoots);
+						} catch {
+							// Path outside allowed roots — skip deletion, still remove record
+							deletedCount++;
+							continue;
+						}
+					}
 					try {
 						unlinkSync(record.sessionFile);
 					} catch {
