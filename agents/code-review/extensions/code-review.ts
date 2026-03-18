@@ -441,51 +441,62 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 		const baseIntervalMs = intervalHours * 3600_000;
 
 		const loop = async () => {
-			if (!loopActive) return;
+			try {
+				if (!loopActive) return;
 
-			// Daily cycle limit
-			const today = new Date().toISOString().slice(0, 10);
-			const stats = readJson<DailyStats>(dailyStatsPath, { date: today, cycleCount: 0 });
-			if (stats.date !== today) {
-				stats.date = today;
-				stats.cycleCount = 0;
-			}
-			if (stats.cycleCount >= LIMITS.maxCyclesPerDay) {
-				ctx.ui.notify(
-					`Daily cycle limit reached (${LIMITS.maxCyclesPerDay}). Waiting until tomorrow.`,
-					"warning",
-				);
-				// Wait until next day (check every hour)
-				if (loopActive) loopTimer = setTimeout(loop, 3600_000);
-				return;
-			}
+				// Daily cycle limit
+				const today = new Date().toISOString().slice(0, 10);
+				const stats = readJson<DailyStats>(dailyStatsPath, { date: today, cycleCount: 0 });
+				if (stats.date !== today) {
+					stats.date = today;
+					stats.cycleCount = 0;
+				}
+				if (stats.cycleCount >= LIMITS.maxCyclesPerDay) {
+					ctx.ui.notify(
+						`Daily cycle limit reached (${LIMITS.maxCyclesPerDay}). Waiting until tomorrow.`,
+						"warning",
+					);
+					if (loopActive) loopTimer = setTimeout(loop, 3600_000);
+					return;
+				}
 
-			const prevFailures = consecutiveFailures;
-			await runCycle(repo, ctx);
+				const prevFailures = consecutiveFailures;
+				await runCycle(repo, ctx);
 
-			// Only count successful cycles toward daily limit
-			if (consecutiveFailures === prevFailures || consecutiveFailures === 0) {
-				stats.cycleCount++;
-				atomicWriteJson(dailyStatsPath, stats);
-			}
+				// Only count successful cycles toward daily limit
+				if (consecutiveFailures === prevFailures || consecutiveFailures === 0) {
+					stats.cycleCount++;
+					atomicWriteJson(dailyStatsPath, stats);
+				}
 
-			// Circuit breaker
-			if (consecutiveFailures >= LIMITS.maxConsecutiveFailures) {
-				ctx.ui.notify(
-					`Circuit breaker: ${consecutiveFailures} consecutive failures. Loop stopped. Use /review-start to resume.`,
-					"error",
-				);
-				loopActive = false;
-				return;
-			}
+				// Circuit breaker
+				if (consecutiveFailures >= LIMITS.maxConsecutiveFailures) {
+					ctx.ui.notify(
+						`Circuit breaker: ${consecutiveFailures} consecutive failures. Loop stopped. Use /review-start to resume.`,
+						"error",
+					);
+					loopActive = false;
+					return;
+				}
 
-			if (loopActive) {
-				// Back off on failures: double interval for each consecutive failure
-				const backoffMultiplier = consecutiveFailures > 0 ? Math.pow(2, consecutiveFailures) : 1;
-				const actualInterval = baseIntervalMs * backoffMultiplier;
-				const hours = (actualInterval / 3600_000).toFixed(1);
-				loopTimer = setTimeout(loop, actualInterval);
-				ctx.ui.notify(`Next review in ${hours} hour(s)`, "info");
+				if (loopActive) {
+					const backoffMultiplier = consecutiveFailures > 0 ? Math.pow(2, consecutiveFailures) : 1;
+					const actualInterval = baseIntervalMs * backoffMultiplier;
+					const hours = (actualInterval / 3600_000).toFixed(1);
+					loopTimer = setTimeout(loop, actualInterval);
+					ctx.ui.notify(`Next review in ${hours} hour(s)`, "info");
+				}
+			} catch (err: any) {
+				// Catch-all to prevent unhandled promise rejection from the floating loop() call
+				ctx.ui.notify(`Loop error: ${err.message}`, "error");
+				consecutiveFailures++;
+				if (consecutiveFailures >= LIMITS.maxConsecutiveFailures) {
+					loopActive = false;
+					ctx.ui.notify("Circuit breaker triggered from loop error. Loop stopped.", "error");
+				} else if (loopActive) {
+					const backoffMultiplier = Math.pow(2, consecutiveFailures);
+					loopTimer = setTimeout(loop, baseIntervalMs * backoffMultiplier);
+				}
 			}
 		};
 
@@ -527,14 +538,13 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			updateCycleState({ status: "cloning", repo, startedAt: new Date().toISOString() });
 			const repoDir = ensureRepo(repo, ctx);
 			if (!repoDir) {
-				updateCycleState({ status: "idle" });
-				return;
+				throw new Error("Failed to clone or update repository");
 			}
 
 			// Step 2: Select file
 			const file = selectFile(repo, repoDir, prevCycle.status !== "idle" ? prevCycle.file : undefined);
 			if (!file) {
-				ctx.ui.notify("No files available for review (all reviewed). Use /review-reset to start over.", "info");
+				// All files reviewed is not a failure — just skip this cycle without penalizing
 				updateCycleState({ status: "idle" });
 				return;
 			}
