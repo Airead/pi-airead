@@ -1,0 +1,21 @@
+{
+  "name": "pi-airead",
+  "version": "1.0.0",
+  "description": "Personal extensions for [pi coding-agent](https://github.com/badlogic/pi-mono).",
+  "main": "index.js",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Airead/pi-airead.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/Airead/pi-airead/issues"
+  },
+  "homepage": "https://github.com/Airead/pi-airead#readme"
+}

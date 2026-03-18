@@ -1,14 +1,30 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+	type CycleState,
+	type DailyStats,
+	type Finding,
+	type ReviewedFiles,
+	type SessionRecord,
+	type VerifyResult,
+	atomicWriteJson,
+	cleanupOldSessions,
+	ensureDir,
+	isCodeFile,
+	mergeFindingsIntoCache,
+	readJson,
+	trimReviewedFiles,
+	validateRepo,
+} from "./code-review-utils.js";
 
 // ============================================================================
 // Resource Safety Limits
 // ============================================================================
 
-const LIMITS = {
+export const LIMITS = {
 	/** Max review cycles per calendar day */
 	maxCyclesPerDay: 20,
 	/** Max tool calls per sub-agent before abort */
@@ -26,52 +42,6 @@ const LIMITS = {
 	/** Max repo size in MB (refuse to clone larger repos) */
 	maxRepoSizeMb: 500,
 } as const;
-
-// ============================================================================
-// Types
-// ============================================================================
-
-interface DailyStats {
-	date: string;
-	cycleCount: number;
-}
-
-interface Finding {
-	file: string;
-	line: number;
-	endLine: number;
-	severity: "critical" | "high" | "medium";
-	category: "security" | "bug" | "performance" | "design" | "maintainability";
-	title: string;
-	description: string;
-	codeSnippet: string;
-	suggestion: string;
-}
-
-interface CycleState {
-	status: "idle" | "cloning" | "reviewing" | "verifying";
-	file?: string;
-	repo?: string;
-	startedAt?: string;
-}
-
-interface ReviewedFiles {
-	[repo: string]: { [file: string]: string };
-}
-
-interface VerifyResult {
-	status: "submitted" | "rejected";
-	issueUrl?: string;
-	reason?: string;
-	finding: Finding;
-}
-
-interface SessionRecord {
-	timestamp: string;
-	type: "review" | "verify";
-	file: string;
-	sessionFile?: string;
-}
 
 // ============================================================================
 // Lightweight RPC Client (avoids import issues with pi internals)
@@ -320,29 +290,6 @@ class SubAgentClient {
 			throw new Error(response.error ?? "Unknown RPC error");
 		}
 		return response.data as T;
-	}
-}
-
-// ============================================================================
-// State Management
-// ============================================================================
-
-function ensureDir(dir: string): void {
-	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-}
-
-function atomicWriteJson(filePath: string, data: unknown): void {
-	ensureDir(dirname(filePath));
-	const tmp = filePath + ".tmp";
-	writeFileSync(tmp, JSON.stringify(data, null, 2), "utf-8");
-	renameSync(tmp, filePath);
-}
-
-function readJson<T>(filePath: string, fallback: T): T {
-	try {
-		return JSON.parse(readFileSync(filePath, "utf-8")) as T;
-	} catch {
-		return fallback;
 	}
 }
 
@@ -600,8 +547,8 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			consecutiveFailures = 0;
 
 			// Housekeeping after successful cycle
-			cleanupOldSessions();
-			trimReviewedFiles(repo);
+			cleanupOldSessions(sessionsPath, LIMITS.sessionRetentionDays);
+			trimReviewedFiles(reviewedFilesPath, repo, LIMITS.maxReviewedFilesPerRepo);
 		} catch (err: any) {
 			consecutiveFailures++;
 			ctx.ui.notify(
@@ -631,10 +578,6 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 	// ========================================================================
 	// Repository Management
 	// ========================================================================
-
-	function validateRepo(repo: string): boolean {
-		return /^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/.test(repo);
-	}
 
 	function ensureRepo(repo: string, ctx: any): string | null {
 		if (!validateRepo(repo)) {
@@ -731,83 +674,6 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 		return candidates[Math.floor(Math.random() * candidates.length)];
 	}
 
-	function isCodeFile(file: string): boolean {
-		const codeExtensions = new Set([
-			".ts",
-			".tsx",
-			".js",
-			".jsx",
-			".mjs",
-			".cjs",
-			".py",
-			".go",
-			".rs",
-			".java",
-			".kt",
-			".scala",
-			".c",
-			".cpp",
-			".h",
-			".hpp",
-			".cs",
-			".rb",
-			".php",
-			".swift",
-			".m",
-			".mm",
-			".vue",
-			".svelte",
-			".astro",
-			".sh",
-			".bash",
-			".zsh",
-			".sql",
-			".graphql",
-			".gql",
-			".proto",
-			".yaml",
-			".yml",
-			".toml",
-			".zig",
-			".lua",
-			".ex",
-			".exs",
-			".erl",
-			".hrl",
-			".clj",
-			".cljs",
-			".elm",
-			".hs",
-			".ml",
-			".mli",
-			".r",
-			".R",
-			".dart",
-			".nim",
-			".v",
-			".sol",
-		]);
-
-		const ext = "." + file.split(".").pop();
-		if (!codeExtensions.has(ext)) return false;
-
-		// Exclude common non-reviewable paths
-		const excludePatterns = [
-			"node_modules/",
-			"vendor/",
-			"dist/",
-			"build/",
-			".min.",
-			"package-lock.json",
-			"yarn.lock",
-			"pnpm-lock.yaml",
-			"__snapshots__/",
-			".generated.",
-			"/generated/",
-		];
-		return !excludePatterns.some((p) => file.includes(p));
-	}
-
 	// ========================================================================
 	// Round 1: Review
 	// ========================================================================
@@ -888,18 +754,7 @@ Review the file thoroughly and write your findings as a JSON array to the output
 	}
 
 	function mergeFindingsCache(newFindings: Finding[]): void {
-		const cache = readJson<Finding[]>(findingsCachePath, []);
-
-		// Add new findings
-		cache.push(...newFindings);
-
-		// Sort by severity (critical > high > medium)
-		const severityOrder: Record<string, number> = { critical: 0, high: 1, medium: 2 };
-		cache.sort((a, b) => (severityOrder[a.severity] ?? 3) - (severityOrder[b.severity] ?? 3));
-
-		// Keep top 10
-		const trimmed = cache.slice(0, 10);
-		atomicWriteJson(findingsCachePath, trimmed);
+		mergeFindingsIntoCache(findingsCachePath, newFindings, 10);
 	}
 
 	// ========================================================================
@@ -998,54 +853,6 @@ Verify this finding by re-reading the actual code, check for duplicates, and sub
 	}
 
 	// ========================================================================
-	// Housekeeping
+	// Housekeeping (delegated to utils)
 	// ========================================================================
-
-	function cleanupOldSessions(): void {
-		try {
-			const sessions = readJson<SessionRecord[]>(sessionsPath, []);
-			const cutoff = Date.now() - LIMITS.sessionRetentionDays * 86400_000;
-			const kept: SessionRecord[] = [];
-
-			for (const record of sessions) {
-				if (new Date(record.timestamp).getTime() < cutoff) {
-					// Delete the actual session file
-					if (record.sessionFile) {
-						try {
-							unlinkSync(record.sessionFile);
-						} catch {
-							// File may already be deleted
-						}
-					}
-				} else {
-					kept.push(record);
-				}
-			}
-
-			if (kept.length !== sessions.length) {
-				atomicWriteJson(sessionsPath, kept);
-			}
-		} catch {
-			// Cleanup is best-effort
-		}
-	}
-
-	function trimReviewedFiles(repo: string): void {
-		try {
-			const reviewed = readJson<ReviewedFiles>(reviewedFilesPath, {});
-			const repoReviewed = reviewed[repo];
-			if (!repoReviewed) return;
-
-			const entries = Object.entries(repoReviewed);
-			if (entries.length <= LIMITS.maxReviewedFilesPerRepo) return;
-
-			// Sort by date, keep newest half
-			entries.sort(([, a], [, b]) => new Date(b).getTime() - new Date(a).getTime());
-			const keepCount = Math.floor(LIMITS.maxReviewedFilesPerRepo / 2);
-			reviewed[repo] = Object.fromEntries(entries.slice(0, keepCount));
-			atomicWriteJson(reviewedFilesPath, reviewed);
-		} catch {
-			// Trim is best-effort
-		}
-	}
 }
