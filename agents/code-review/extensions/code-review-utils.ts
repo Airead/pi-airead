@@ -103,6 +103,81 @@ export function isCodeFile(file: string): boolean {
 }
 
 // ============================================================================
+// Safety Gates & Daily Stats
+// ============================================================================
+
+export interface SafetyLimits {
+	maxConsecutiveFailures: number;
+	maxCyclesPerDay: number;
+}
+
+/** Returns an error message if the cycle should be blocked, null if OK. */
+export function checkSafetyGates(
+	consecutiveFailures: number,
+	dailyStats: DailyStats,
+	today: string,
+	limits: SafetyLimits,
+): string | null {
+	if (consecutiveFailures >= limits.maxConsecutiveFailures) {
+		return `Circuit breaker active: ${consecutiveFailures} consecutive failures. Use /review-start to reset.`;
+	}
+	const cycleCount = dailyStats.date === today ? dailyStats.cycleCount : 0;
+	if (cycleCount >= limits.maxCyclesPerDay) {
+		return `Daily cycle limit reached (${cycleCount}/${limits.maxCyclesPerDay}).`;
+	}
+	return null;
+}
+
+/** Returns updated daily stats with the cycle count incremented, handling day rollover. */
+export function incrementDailyStats(stats: DailyStats, today: string): DailyStats {
+	if (stats.date !== today) {
+		return { date: today, cycleCount: 1 };
+	}
+	return { date: stats.date, cycleCount: stats.cycleCount + 1 };
+}
+
+// ============================================================================
+// File Selection
+// ============================================================================
+
+export interface FileSelectionResult {
+	file: string | undefined;
+	updatedReviewed: Record<string, string>;
+}
+
+/**
+ * Select the next file to review from allFiles, skipping already-reviewed ones.
+ * When all files are reviewed, resets the oldest half and picks from the rest.
+ */
+export function selectNextFile(
+	allFiles: string[],
+	repoReviewed: Record<string, string>,
+): FileSelectionResult {
+	if (allFiles.length === 0) {
+		return { file: undefined, updatedReviewed: { ...repoReviewed } };
+	}
+
+	let reviewed = { ...repoReviewed };
+	let candidates = allFiles.filter((f) => !reviewed[f]);
+
+	if (candidates.length === 0) {
+		// Reset oldest half
+		const sorted = Object.entries(reviewed).sort(
+			([, a], [, b]) => new Date(a).getTime() - new Date(b).getTime(),
+		);
+		const resetCount = Math.max(1, Math.floor(sorted.length / 2));
+		reviewed = { ...reviewed };
+		for (let i = 0; i < resetCount; i++) {
+			delete reviewed[sorted[i][0]];
+		}
+		candidates = allFiles.filter((f) => !reviewed[f]);
+	}
+
+	const file = candidates[Math.floor(Math.random() * candidates.length)];
+	return { file, updatedReviewed: reviewed };
+}
+
+// ============================================================================
 // Findings Cache
 // ============================================================================
 

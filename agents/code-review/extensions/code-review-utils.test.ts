@@ -3,15 +3,19 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
+	type DailyStats,
 	type Finding,
 	type ReviewedFiles,
 	type SessionRecord,
 	atomicWriteJson,
+	checkSafetyGates,
 	cleanupOldSessions,
 	ensureDir,
+	incrementDailyStats,
 	isCodeFile,
 	mergeFindingsIntoCache,
 	readJson,
+	selectNextFile,
 	trimReviewedFiles,
 	validateRepo,
 } from "./code-review-utils.js";
@@ -361,5 +365,134 @@ describe("trimReviewedFiles", () => {
 	it("handles missing file gracefully", () => {
 		const removed = trimReviewedFiles(join(testDir, "nope.json"), "a/b", 100);
 		expect(removed).toBe(0);
+	});
+});
+
+// ============================================================================
+// checkSafetyGates
+// ============================================================================
+
+describe("checkSafetyGates", () => {
+	const limits = { maxConsecutiveFailures: 5, maxCyclesPerDay: 20 };
+	const today = "2026-03-18";
+
+	it("returns null when within all limits", () => {
+		const stats: DailyStats = { date: today, cycleCount: 5 };
+		expect(checkSafetyGates(0, stats, today, limits)).toBeNull();
+	});
+
+	it("triggers circuit breaker on consecutive failures", () => {
+		const stats: DailyStats = { date: today, cycleCount: 0 };
+		const result = checkSafetyGates(5, stats, today, limits);
+		expect(result).toContain("Circuit breaker");
+		expect(result).toContain("5");
+	});
+
+	it("triggers circuit breaker at exact threshold", () => {
+		const stats: DailyStats = { date: today, cycleCount: 0 };
+		expect(checkSafetyGates(5, stats, today, limits)).not.toBeNull();
+		expect(checkSafetyGates(4, stats, today, limits)).toBeNull();
+	});
+
+	it("triggers daily cycle limit", () => {
+		const stats: DailyStats = { date: today, cycleCount: 20 };
+		const result = checkSafetyGates(0, stats, today, limits);
+		expect(result).toContain("Daily cycle limit");
+	});
+
+	it("ignores stale daily stats from a different day", () => {
+		const stats: DailyStats = { date: "2026-03-17", cycleCount: 100 };
+		expect(checkSafetyGates(0, stats, today, limits)).toBeNull();
+	});
+
+	it("checks circuit breaker before daily limit", () => {
+		const stats: DailyStats = { date: today, cycleCount: 20 };
+		const result = checkSafetyGates(5, stats, today, limits);
+		expect(result).toContain("Circuit breaker");
+	});
+});
+
+// ============================================================================
+// incrementDailyStats
+// ============================================================================
+
+describe("incrementDailyStats", () => {
+	it("increments cycle count for same day", () => {
+		const stats: DailyStats = { date: "2026-03-18", cycleCount: 3 };
+		const result = incrementDailyStats(stats, "2026-03-18");
+		expect(result).toEqual({ date: "2026-03-18", cycleCount: 4 });
+	});
+
+	it("resets count on new day", () => {
+		const stats: DailyStats = { date: "2026-03-17", cycleCount: 15 };
+		const result = incrementDailyStats(stats, "2026-03-18");
+		expect(result).toEqual({ date: "2026-03-18", cycleCount: 1 });
+	});
+
+	it("does not mutate input", () => {
+		const stats: DailyStats = { date: "2026-03-18", cycleCount: 3 };
+		incrementDailyStats(stats, "2026-03-18");
+		expect(stats.cycleCount).toBe(3);
+	});
+});
+
+// ============================================================================
+// selectNextFile
+// ============================================================================
+
+describe("selectNextFile", () => {
+	it("returns undefined for empty file list", () => {
+		const result = selectNextFile([], {});
+		expect(result.file).toBeUndefined();
+	});
+
+	it("selects from unreviewed files", () => {
+		const allFiles = ["a.ts", "b.ts", "c.ts"];
+		const reviewed = { "a.ts": "2026-01-01" };
+		const result = selectNextFile(allFiles, reviewed);
+		expect(result.file).toBeDefined();
+		expect(["b.ts", "c.ts"]).toContain(result.file);
+	});
+
+	it("does not select already-reviewed files", () => {
+		const allFiles = ["a.ts", "b.ts"];
+		const reviewed = { "a.ts": "2026-01-01" };
+		const result = selectNextFile(allFiles, reviewed);
+		expect(result.file).toBe("b.ts");
+	});
+
+	it("resets oldest half when all files are reviewed", () => {
+		const allFiles = ["a.ts", "b.ts", "c.ts", "d.ts"];
+		const reviewed: Record<string, string> = {
+			"a.ts": "2026-01-01",
+			"b.ts": "2026-01-02",
+			"c.ts": "2026-01-03",
+			"d.ts": "2026-01-04",
+		};
+		const result = selectNextFile(allFiles, reviewed);
+		expect(result.file).toBeDefined();
+		// Oldest half (a.ts, b.ts) should be removed from reviewed
+		expect(result.updatedReviewed["a.ts"]).toBeUndefined();
+		expect(result.updatedReviewed["b.ts"]).toBeUndefined();
+		// Newest half should remain
+		expect(result.updatedReviewed["c.ts"]).toBeDefined();
+		expect(result.updatedReviewed["d.ts"]).toBeDefined();
+		// Selected file should be from the reset ones
+		expect(["a.ts", "b.ts"]).toContain(result.file);
+	});
+
+	it("does not mutate the input reviewed map", () => {
+		const allFiles = ["a.ts", "b.ts"];
+		const reviewed = { "a.ts": "2026-01-01", "b.ts": "2026-01-02" };
+		selectNextFile(allFiles, reviewed);
+		expect(Object.keys(reviewed)).toHaveLength(2);
+	});
+
+	it("resets at least one file when all reviewed", () => {
+		const allFiles = ["only.ts"];
+		const reviewed = { "only.ts": "2026-01-01" };
+		const result = selectNextFile(allFiles, reviewed);
+		expect(result.file).toBe("only.ts");
+		expect(result.updatedReviewed["only.ts"]).toBeUndefined();
 	});
 });

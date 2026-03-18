@@ -11,11 +11,14 @@ import {
 	type SessionRecord,
 	type VerifyResult,
 	atomicWriteJson,
+	checkSafetyGates,
 	cleanupOldSessions,
 	ensureDir,
+	incrementDailyStats,
 	isCodeFile,
 	mergeFindingsIntoCache,
 	readJson,
+	selectNextFile,
 	trimReviewedFiles,
 	validateRepo,
 } from "./code-review-utils.js";
@@ -360,7 +363,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify("A review cycle is already running", "warning");
 				return;
 			}
-			const blocked = checkSafetyGates();
+			const blocked = checkSafetyGatesLocal();
 			if (blocked) {
 				ctx.ui.notify(blocked, "warning");
 				return;
@@ -368,7 +371,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			const prevFailures = consecutiveFailures;
 			const didRun = await runCycle(repo, ctx);
 			if (didRun && (consecutiveFailures === prevFailures || consecutiveFailures === 0)) {
-				incrementDailyStats();
+				incrementDailyStatsLocal();
 			}
 		},
 	});
@@ -441,32 +444,17 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 	let isRunning = false;
 	let consecutiveFailures = 0;
 
-	/** Shared safety gate — returns error message if cycle should be blocked, null if OK */
-	function checkSafetyGates(): string | null {
-		// Circuit breaker
-		if (consecutiveFailures >= LIMITS.maxConsecutiveFailures) {
-			return `Circuit breaker active: ${consecutiveFailures} consecutive failures. Use /review-start to reset.`;
-		}
-		// Daily cycle limit
+	function checkSafetyGatesLocal(): string | null {
 		const today = new Date().toISOString().slice(0, 10);
 		const stats = readJson<DailyStats>(dailyStatsPath, { date: today, cycleCount: 0 });
-		const cycleCount = stats.date === today ? stats.cycleCount : 0;
-		if (cycleCount >= LIMITS.maxCyclesPerDay) {
-			return `Daily cycle limit reached (${cycleCount}/${LIMITS.maxCyclesPerDay}).`;
-		}
-		return null;
+		return checkSafetyGates(consecutiveFailures, stats, today, LIMITS);
 	}
 
-	/** Increment daily stats after a successful cycle */
-	function incrementDailyStats(): void {
+	function incrementDailyStatsLocal(): void {
 		const today = new Date().toISOString().slice(0, 10);
 		const stats = readJson<DailyStats>(dailyStatsPath, { date: today, cycleCount: 0 });
-		if (stats.date !== today) {
-			stats.date = today;
-			stats.cycleCount = 0;
-		}
-		stats.cycleCount++;
-		atomicWriteJson(dailyStatsPath, stats);
+		const updated = incrementDailyStats(stats, today);
+		atomicWriteJson(dailyStatsPath, updated);
 	}
 
 	function startReviewLoop(repo: string, ctx: any): void {
@@ -490,7 +478,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			try {
 				if (!loopActive) return;
 
-				const blocked = checkSafetyGates();
+				const blocked = checkSafetyGatesLocal();
 				if (blocked) {
 					ctx.ui.notify(blocked, "warning");
 					// Check again in 1 hour (e.g., daily limit may reset at midnight)
@@ -503,7 +491,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 
 				// Only count cycles that actually ran toward daily limit
 				if (didRun && (consecutiveFailures === prevFailures || consecutiveFailures === 0)) {
-					incrementDailyStats();
+					incrementDailyStatsLocal();
 				}
 
 				// Circuit breaker (re-check after cycle, since runCycle may have incremented failures)
@@ -710,29 +698,17 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			.filter(Boolean)
 			.filter((f) => isCodeFile(f));
 
-		if (allFiles.length === 0) return undefined;
-
-		// Filter out already reviewed files
 		const reviewed = readJson<ReviewedFiles>(reviewedFilesPath, {});
 		const repoReviewed = reviewed[repo] ?? {};
-		let candidates = allFiles.filter((f) => !repoReviewed[f]);
+		const { file, updatedReviewed } = selectNextFile(allFiles, repoReviewed);
 
-		// If all files reviewed, reset to the oldest reviewed ones
-		if (candidates.length === 0) {
-			const sorted = Object.entries(repoReviewed).sort(
-				([, a], [, b]) => new Date(a).getTime() - new Date(b).getTime(),
-			);
-			// Reset oldest half
-			const resetCount = Math.max(1, Math.floor(sorted.length / 2));
-			for (let i = 0; i < resetCount; i++) {
-				delete repoReviewed[sorted[i][0]];
-			}
+		// Persist if reviewed map was modified (oldest-half reset)
+		if (Object.keys(updatedReviewed).length !== Object.keys(repoReviewed).length) {
+			reviewed[repo] = updatedReviewed;
 			atomicWriteJson(reviewedFilesPath, reviewed);
-			candidates = allFiles.filter((f) => !repoReviewed[f]);
 		}
 
-		// Random selection
-		return candidates[Math.floor(Math.random() * candidates.length)];
+		return file;
 	}
 
 	// ========================================================================
