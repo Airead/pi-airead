@@ -366,8 +366,8 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				return;
 			}
 			const prevFailures = consecutiveFailures;
-			await runCycle(repo, ctx);
-			if (consecutiveFailures === prevFailures || consecutiveFailures === 0) {
+			const didRun = await runCycle(repo, ctx);
+			if (didRun && (consecutiveFailures === prevFailures || consecutiveFailures === 0)) {
 				incrementDailyStats();
 			}
 		},
@@ -499,10 +499,10 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				}
 
 				const prevFailures = consecutiveFailures;
-				await runCycle(repo, ctx);
+				const didRun = await runCycle(repo, ctx);
 
-				// Only count successful cycles toward daily limit
-				if (consecutiveFailures === prevFailures || consecutiveFailures === 0) {
+				// Only count cycles that actually ran toward daily limit
+				if (didRun && (consecutiveFailures === prevFailures || consecutiveFailures === 0)) {
 					incrementDailyStats();
 				}
 
@@ -537,8 +537,9 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 	// Review Cycle
 	// ========================================================================
 
-	async function runCycle(repo: string, ctx: any): Promise<void> {
-		if (isRunning) return;
+	/** Returns true if cycle actually ran, false if skipped (e.g., already running) */
+	async function runCycle(repo: string, ctx: any): Promise<boolean> {
+		if (isRunning) return false;
 		isRunning = true;
 
 		try {
@@ -555,7 +556,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				consecutiveFailures = 0;
 				cleanupOldSessions(sessionsPath, LIMITS.sessionRetentionDays);
 				trimReviewedFiles(reviewedFilesPath, repo, LIMITS.maxReviewedFilesPerRepo);
-				return;
+				return true;
 			}
 
 			if (prevCycle.status !== "idle" && prevCycle.file) {
@@ -575,7 +576,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			if (!file) {
 				// All files reviewed is not a failure — just skip this cycle without penalizing
 				updateCycleState({ status: "idle" });
-				return;
+				return true;
 			}
 
 			ctx.ui.notify(`Reviewing: ${file}`, "info");
@@ -600,6 +601,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			// Housekeeping after successful cycle
 			cleanupOldSessions(sessionsPath, LIMITS.sessionRetentionDays);
 			trimReviewedFiles(reviewedFilesPath, repo, LIMITS.maxReviewedFilesPerRepo);
+			return true;
 		} catch (err: any) {
 			consecutiveFailures++;
 			ctx.ui.notify(
@@ -607,6 +609,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				"error",
 			);
 			updateCycleState({ status: "idle" });
+			return true; // Cycle ran but failed — still counts as "attempted"
 		} finally {
 			isRunning = false;
 		}
@@ -630,6 +633,32 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 	// Repository Management
 	// ========================================================================
 
+	/** Returns true if repo exceeds size limit. Best-effort (returns false on API failure). */
+	function isRepoTooLarge(repo: string, ctx: any): boolean {
+		try {
+			const repoInfo = execFileSync("gh", ["api", `repos/${repo}`, "--jq", ".size"], {
+				encoding: "utf-8",
+				stdio: ["pipe", "pipe", "pipe"],
+				timeout: 15_000,
+			}).trim();
+			const sizeKb = parseInt(repoInfo, 10);
+			if (!isNaN(sizeKb) && sizeKb / 1024 > LIMITS.maxRepoSizeMb) {
+				ctx.ui.notify(
+					`Repository ${repo} is ${(sizeKb / 1024).toFixed(0)}MB, exceeds ${LIMITS.maxRepoSizeMb}MB limit. Skipping.`,
+					"error",
+				);
+				return true;
+			}
+		} catch {
+			// Size check is best-effort
+		}
+		return false;
+	}
+
+	function cloneRepo(repo: string, repoDir: string): void {
+		execFileSync("gh", ["repo", "clone", repo, repoDir], { stdio: "pipe", timeout: 300_000 });
+	}
+
 	function ensureRepo(repo: string, ctx: any): string | null {
 		if (!validateRepo(repo)) {
 			ctx.ui.notify(`Invalid repo format: ${repo}. Expected: owner/repo`, "error");
@@ -641,27 +670,6 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 		const repoDir = join(workspaceDir, repoName);
 
 		try {
-			// Check repo size before first clone
-			if (!existsSync(join(repoDir, ".git"))) {
-				try {
-					const repoInfo = execFileSync("gh", ["api", `repos/${repo}`, "--jq", ".size"], {
-						encoding: "utf-8",
-						stdio: ["pipe", "pipe", "pipe"],
-						timeout: 15_000,
-					}).trim();
-					const sizeKb = parseInt(repoInfo, 10);
-					if (!isNaN(sizeKb) && sizeKb / 1024 > LIMITS.maxRepoSizeMb) {
-						ctx.ui.notify(
-							`Repository ${repo} is ${(sizeKb / 1024).toFixed(0)}MB, exceeds ${LIMITS.maxRepoSizeMb}MB limit. Skipping.`,
-							"error",
-						);
-						return null;
-					}
-				} catch {
-					// Size check is best-effort, proceed with clone
-				}
-			}
-
 			if (existsSync(join(repoDir, ".git"))) {
 				// Verify and pull
 				try {
@@ -669,15 +677,17 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 					execFileSync("git", ["pull", "--ff-only"], { cwd: repoDir, stdio: "pipe", timeout: 60_000 });
 					ctx.ui.notify(`Repository updated: ${repo}`, "info");
 				} catch {
-					// Broken repo, re-clone
+					// Broken repo — check size before re-clone
 					ctx.ui.notify(`Repository broken, re-cloning: ${repo}`, "warning");
 					execFileSync("rm", ["-rf", repoDir], { stdio: "pipe" });
-					execFileSync("gh", ["repo", "clone", repo, repoDir], { stdio: "pipe", timeout: 300_000 });
+					if (isRepoTooLarge(repo, ctx)) return null;
+					cloneRepo(repo, repoDir);
 				}
 			} else {
-				// Fresh clone
+				// Fresh clone — check size first
+				if (isRepoTooLarge(repo, ctx)) return null;
 				ctx.ui.notify(`Cloning repository: ${repo}`, "info");
-				execFileSync("gh", ["repo", "clone", repo, repoDir], { stdio: "pipe", timeout: 300_000 });
+				cloneRepo(repo, repoDir);
 			}
 			return repoDir;
 		} catch (err: any) {
