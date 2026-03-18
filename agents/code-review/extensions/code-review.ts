@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { type ChildProcess, execSync, spawn } from "node:child_process";
+import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -115,6 +115,13 @@ class SubAgentClient {
 
 	async stop(): Promise<void> {
 		if (!this.process) return;
+
+		// Skip wait if process already exited
+		if (this.process.exitCode !== null) {
+			this.process = null;
+			this.pendingRequests.clear();
+			return;
+		}
 
 		this.process.kill("SIGTERM");
 		await new Promise<void>((resolve) => {
@@ -317,7 +324,9 @@ function readJson<T>(filePath: string, fallback: T): T {
 
 export default function codeReviewExtension(pi: ExtensionAPI): void {
 	// Resolve paths relative to this extension file
-	const currentFile = fileURLToPath(import.meta.url);
+	// jiti may provide __filename (CJS compat) or import.meta.url (ESM)
+	const currentFile =
+		typeof __filename !== "undefined" ? __filename : fileURLToPath(import.meta.url);
 	const extensionDir = dirname(dirname(currentFile));
 	const stateDir = join(extensionDir, "state");
 	const workspaceDir = join(extensionDir, "workspace");
@@ -486,14 +495,14 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 
 			// Step 1: Clone or pull
 			updateCycleState({ status: "cloning", repo, startedAt: new Date().toISOString() });
-			const repoDir = await ensureRepo(repo, ctx);
+			const repoDir = ensureRepo(repo, ctx);
 			if (!repoDir) {
 				updateCycleState({ status: "idle" });
 				return;
 			}
 
 			// Step 2: Select file
-			const file = await selectFile(repo, repoDir, prevCycle.status !== "idle" ? prevCycle.file : undefined);
+			const file = selectFile(repo, repoDir, prevCycle.status !== "idle" ? prevCycle.file : undefined);
 			if (!file) {
 				ctx.ui.notify("No files available for review (all reviewed). Use /review-reset to start over.", "info");
 				updateCycleState({ status: "idle" });
@@ -519,6 +528,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			finishCycle(repo, file);
 		} catch (err: any) {
 			ctx.ui.notify(`Review cycle error: ${err.message}`, "error");
+			updateCycleState({ status: "idle" });
 		} finally {
 			isRunning = false;
 		}
@@ -542,7 +552,16 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 	// Repository Management
 	// ========================================================================
 
+	function validateRepo(repo: string): boolean {
+		return /^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/.test(repo);
+	}
+
 	function ensureRepo(repo: string, ctx: any): string | null {
+		if (!validateRepo(repo)) {
+			ctx.ui.notify(`Invalid repo format: ${repo}. Expected: owner/repo`, "error");
+			return null;
+		}
+
 		ensureDir(workspaceDir);
 		const repoName = repo.replace("/", "_");
 		const repoDir = join(workspaceDir, repoName);
@@ -551,19 +570,19 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			if (existsSync(join(repoDir, ".git"))) {
 				// Verify and pull
 				try {
-					execSync("git status", { cwd: repoDir, stdio: "pipe" });
-					execSync("git pull --ff-only", { cwd: repoDir, stdio: "pipe", timeout: 60_000 });
+					execFileSync("git", ["status"], { cwd: repoDir, stdio: "pipe" });
+					execFileSync("git", ["pull", "--ff-only"], { cwd: repoDir, stdio: "pipe", timeout: 60_000 });
 					ctx.ui.notify(`Repository updated: ${repo}`, "info");
 				} catch {
 					// Broken repo, re-clone
 					ctx.ui.notify(`Repository broken, re-cloning: ${repo}`, "warning");
-					execSync(`rm -rf "${repoDir}"`, { stdio: "pipe" });
-					execSync(`gh repo clone ${repo} "${repoDir}"`, { stdio: "pipe", timeout: 300_000 });
+					execFileSync("rm", ["-rf", repoDir], { stdio: "pipe" });
+					execFileSync("gh", ["repo", "clone", repo, repoDir], { stdio: "pipe", timeout: 300_000 });
 				}
 			} else {
 				// Fresh clone
 				ctx.ui.notify(`Cloning repository: ${repo}`, "info");
-				execSync(`gh repo clone ${repo} "${repoDir}"`, { stdio: "pipe", timeout: 300_000 });
+				execFileSync("gh", ["repo", "clone", repo, repoDir], { stdio: "pipe", timeout: 300_000 });
 			}
 			return repoDir;
 		} catch (err: any) {
@@ -580,7 +599,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 		if (forceFile) return forceFile;
 
 		// Get all tracked files
-		const output = execSync("git ls-files", { cwd: repoDir, encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 });
+		const output = execFileSync("git", ["ls-files"], { cwd: repoDir, encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 });
 		const allFiles = output
 			.split("\n")
 			.filter(Boolean)
