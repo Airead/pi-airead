@@ -202,7 +202,13 @@ class SubAgentClient {
 
 	async promptAndWait(message: string, timeout = 600_000): Promise<void> {
 		const idlePromise = this.waitForIdle(timeout);
-		await this.prompt(message);
+		try {
+			await this.prompt(message);
+		} catch (err) {
+			// Prevent unhandled rejection from idlePromise if prompt() fails
+			idlePromise.catch(() => {});
+			throw err;
+		}
 		return idlePromise;
 	}
 
@@ -454,11 +460,14 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				return;
 			}
 
+			const prevFailures = consecutiveFailures;
 			await runCycle(repo, ctx);
 
-			// Update daily stats
-			stats.cycleCount++;
-			atomicWriteJson(dailyStatsPath, stats);
+			// Only count successful cycles toward daily limit
+			if (consecutiveFailures === prevFailures || consecutiveFailures === 0) {
+				stats.cycleCount++;
+				atomicWriteJson(dailyStatsPath, stats);
+			}
 
 			// Circuit breaker
 			if (consecutiveFailures >= LIMITS.maxConsecutiveFailures) {
@@ -503,6 +512,9 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify(`Recovering: resuming verification for ${prevCycle.file}`, "info");
 				await runVerifyRound(repo, ctx);
 				finishCycle(repo, prevCycle.file);
+				consecutiveFailures = 0;
+				cleanupOldSessions(sessionsPath, LIMITS.sessionRetentionDays);
+				trimReviewedFiles(reviewedFilesPath, repo, LIMITS.maxReviewedFilesPerRepo);
 				return;
 			}
 
