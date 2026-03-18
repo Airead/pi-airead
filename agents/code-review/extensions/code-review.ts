@@ -14,9 +14,11 @@ import {
 	checkSafetyGates,
 	cleanupOldSessions,
 	ensureDir,
+	filterValidFindings,
 	incrementDailyStats,
 	isCodeFile,
 	mergeFindingsIntoCache,
+	parseIntervalHours,
 	readJson,
 	selectNextFile,
 	trimReviewedFiles,
@@ -462,7 +464,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 		loopActive = true;
 		consecutiveFailures = 0;
 
-		const intervalHours = parseFloat((pi.getFlag("review-interval") as string) ?? "1") || 1;
+		const intervalHours = parseIntervalHours(pi.getFlag("review-interval") as string | undefined);
 		const baseIntervalMs = intervalHours * 3600_000;
 
 		const scheduleNext = () => {
@@ -780,8 +782,13 @@ Review the file thoroughly and write your findings as a JSON array to the output
 			await client.stop();
 		}
 
-		// Merge new findings into cache
-		const newFindings = readJson<Finding[]>(findingsOutputPath, []);
+		// Merge new findings into cache (validate sub-agent output)
+		const rawFindings = readJson<unknown[]>(findingsOutputPath, []);
+		const newFindings = filterValidFindings(rawFindings);
+		const discarded = rawFindings.length - newFindings.length;
+		if (discarded > 0) {
+			ctx.ui.notify(`[Review] Discarded ${discarded} malformed finding(s)`, "warning");
+		}
 		if (newFindings.length > 0) {
 			ctx.ui.notify(`[Review] Found ${newFindings.length} issue(s) in ${file}`, "info");
 			mergeFindingsCache(newFindings);

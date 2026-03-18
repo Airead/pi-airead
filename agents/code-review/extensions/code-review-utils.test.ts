@@ -11,9 +11,12 @@ import {
 	checkSafetyGates,
 	cleanupOldSessions,
 	ensureDir,
+	filterValidFindings,
 	incrementDailyStats,
 	isCodeFile,
+	isValidFinding,
 	mergeFindingsIntoCache,
+	parseIntervalHours,
 	readJson,
 	selectNextFile,
 	trimReviewedFiles,
@@ -494,5 +497,127 @@ describe("selectNextFile", () => {
 		const result = selectNextFile(allFiles, reviewed);
 		expect(result.file).toBe("only.ts");
 		expect(result.updatedReviewed["only.ts"]).toBeUndefined();
+	});
+});
+
+// ============================================================================
+// isValidFinding / filterValidFindings
+// ============================================================================
+
+describe("isValidFinding", () => {
+	it("accepts a valid finding", () => {
+		expect(isValidFinding(makeFinding())).toBe(true);
+	});
+
+	it("rejects null and non-objects", () => {
+		expect(isValidFinding(null)).toBe(false);
+		expect(isValidFinding("string")).toBe(false);
+		expect(isValidFinding(42)).toBe(false);
+		expect(isValidFinding(undefined)).toBe(false);
+	});
+
+	it("rejects missing required fields", () => {
+		const base = makeFinding();
+		for (const key of ["file", "line", "endLine", "severity", "category", "title", "description", "codeSnippet", "suggestion"]) {
+			const copy = { ...base };
+			delete (copy as any)[key];
+			expect(isValidFinding(copy)).toBe(false);
+		}
+	});
+
+	it("rejects empty file and title", () => {
+		expect(isValidFinding(makeFinding({ file: "" }))).toBe(false);
+		expect(isValidFinding(makeFinding({ title: "" }))).toBe(false);
+	});
+
+	it("rejects invalid severity values", () => {
+		expect(isValidFinding({ ...makeFinding(), severity: "low" })).toBe(false);
+		expect(isValidFinding({ ...makeFinding(), severity: "" })).toBe(false);
+	});
+
+	it("rejects invalid category values", () => {
+		expect(isValidFinding({ ...makeFinding(), category: "style" })).toBe(false);
+	});
+
+	it("rejects non-finite line numbers", () => {
+		expect(isValidFinding(makeFinding({ line: NaN }))).toBe(false);
+		expect(isValidFinding(makeFinding({ line: Infinity }))).toBe(false);
+		expect(isValidFinding(makeFinding({ endLine: NaN }))).toBe(false);
+	});
+
+	it("rejects wrong types for string fields", () => {
+		expect(isValidFinding({ ...makeFinding(), description: 123 })).toBe(false);
+		expect(isValidFinding({ ...makeFinding(), suggestion: null })).toBe(false);
+	});
+
+	it("accepts findings with extra fields", () => {
+		expect(isValidFinding({ ...makeFinding(), extraField: "ok" })).toBe(true);
+	});
+});
+
+describe("filterValidFindings", () => {
+	it("keeps only valid findings", () => {
+		const input = [
+			makeFinding({ title: "Good one" }),
+			{ bad: "object" },
+			null,
+			makeFinding({ title: "Another good" }),
+			"not an object",
+		];
+		const result = filterValidFindings(input);
+		expect(result).toHaveLength(2);
+		expect(result[0].title).toBe("Good one");
+		expect(result[1].title).toBe("Another good");
+	});
+
+	it("returns empty array for all-invalid input", () => {
+		expect(filterValidFindings([null, {}, "x", 42])).toEqual([]);
+	});
+
+	it("returns empty array for empty input", () => {
+		expect(filterValidFindings([])).toEqual([]);
+	});
+});
+
+// ============================================================================
+// parseIntervalHours
+// ============================================================================
+
+describe("parseIntervalHours", () => {
+	it("parses valid interval strings", () => {
+		expect(parseIntervalHours("2")).toBe(2);
+		expect(parseIntervalHours("0.5")).toBe(0.5);
+		expect(parseIntervalHours("12")).toBe(12);
+	});
+
+	it("returns default for undefined/null", () => {
+		expect(parseIntervalHours(undefined)).toBe(1);
+		expect(parseIntervalHours(undefined, 2)).toBe(2);
+	});
+
+	it("returns default for non-numeric input", () => {
+		expect(parseIntervalHours("abc")).toBe(1);
+		expect(parseIntervalHours("")).toBe(1);
+	});
+
+	it("returns default for zero and negative values", () => {
+		expect(parseIntervalHours("0")).toBe(1);
+		expect(parseIntervalHours("-5")).toBe(1);
+	});
+
+	it("clamps to minimum 0.1 hours", () => {
+		expect(parseIntervalHours("0.01")).toBe(0.1);
+		expect(parseIntervalHours("0.05")).toBe(0.1);
+	});
+
+	it("clamps to maximum 24 hours", () => {
+		expect(parseIntervalHours("48")).toBe(24);
+		expect(parseIntervalHours("1000")).toBe(24);
+		expect(parseIntervalHours("1e6")).toBe(24);
+	});
+
+	it("returns default for Infinity and NaN strings", () => {
+		expect(parseIntervalHours("Infinity")).toBe(1);
+		expect(parseIntervalHours("NaN")).toBe(1);
 	});
 });

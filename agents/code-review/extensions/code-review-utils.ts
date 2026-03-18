@@ -102,6 +102,39 @@ export function isCodeFile(file: string): boolean {
 	return !excludePatterns.some((p) => file.includes(p));
 }
 
+const VALID_SEVERITIES = new Set(["critical", "high", "medium"]);
+const VALID_CATEGORIES = new Set(["security", "bug", "performance", "design", "maintainability"]);
+
+/** Returns true if the value has all required Finding fields with correct types. */
+export function isValidFinding(value: unknown): value is Finding {
+	if (typeof value !== "object" || value === null) return false;
+	const v = value as Record<string, unknown>;
+	return (
+		typeof v.file === "string" && v.file.length > 0 &&
+		typeof v.line === "number" && Number.isFinite(v.line) &&
+		typeof v.endLine === "number" && Number.isFinite(v.endLine) &&
+		typeof v.severity === "string" && VALID_SEVERITIES.has(v.severity) &&
+		typeof v.category === "string" && VALID_CATEGORIES.has(v.category) &&
+		typeof v.title === "string" && v.title.length > 0 &&
+		typeof v.description === "string" &&
+		typeof v.codeSnippet === "string" &&
+		typeof v.suggestion === "string"
+	);
+}
+
+/** Filters an array of unknown values, returning only valid Findings. */
+export function filterValidFindings(raw: unknown[]): Finding[] {
+	return raw.filter(isValidFinding);
+}
+
+/** Parse interval string to hours, clamped to [0.1, 24]. Returns defaultVal on invalid input. */
+export function parseIntervalHours(input: string | undefined, defaultVal: number = 1): number {
+	if (input == null) return defaultVal;
+	const parsed = parseFloat(input);
+	if (!Number.isFinite(parsed) || parsed <= 0) return defaultVal;
+	return Math.min(Math.max(parsed, 0.1), 24);
+}
+
 // ============================================================================
 // Safety Gates & Daily Stats
 // ============================================================================
