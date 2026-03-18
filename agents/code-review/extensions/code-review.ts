@@ -360,7 +360,16 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify("A review cycle is already running", "warning");
 				return;
 			}
+			const blocked = checkSafetyGates();
+			if (blocked) {
+				ctx.ui.notify(blocked, "warning");
+				return;
+			}
+			const prevFailures = consecutiveFailures;
 			await runCycle(repo, ctx);
+			if (consecutiveFailures === prevFailures || consecutiveFailures === 0) {
+				incrementDailyStats();
+			}
 		},
 	});
 
@@ -432,6 +441,34 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 	let isRunning = false;
 	let consecutiveFailures = 0;
 
+	/** Shared safety gate — returns error message if cycle should be blocked, null if OK */
+	function checkSafetyGates(): string | null {
+		// Circuit breaker
+		if (consecutiveFailures >= LIMITS.maxConsecutiveFailures) {
+			return `Circuit breaker active: ${consecutiveFailures} consecutive failures. Use /review-start to reset.`;
+		}
+		// Daily cycle limit
+		const today = new Date().toISOString().slice(0, 10);
+		const stats = readJson<DailyStats>(dailyStatsPath, { date: today, cycleCount: 0 });
+		const cycleCount = stats.date === today ? stats.cycleCount : 0;
+		if (cycleCount >= LIMITS.maxCyclesPerDay) {
+			return `Daily cycle limit reached (${cycleCount}/${LIMITS.maxCyclesPerDay}).`;
+		}
+		return null;
+	}
+
+	/** Increment daily stats after a successful cycle */
+	function incrementDailyStats(): void {
+		const today = new Date().toISOString().slice(0, 10);
+		const stats = readJson<DailyStats>(dailyStatsPath, { date: today, cycleCount: 0 });
+		if (stats.date !== today) {
+			stats.date = today;
+			stats.cycleCount = 0;
+		}
+		stats.cycleCount++;
+		atomicWriteJson(dailyStatsPath, stats);
+	}
+
 	function startReviewLoop(repo: string, ctx: any): void {
 		if (loopActive) return;
 		loopActive = true;
@@ -440,22 +477,23 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 		const intervalHours = parseFloat((pi.getFlag("review-interval") as string) ?? "1") || 1;
 		const baseIntervalMs = intervalHours * 3600_000;
 
+		const scheduleNext = () => {
+			if (!loopActive) return;
+			const backoffMultiplier = consecutiveFailures > 0 ? Math.pow(2, consecutiveFailures) : 1;
+			const actualInterval = baseIntervalMs * backoffMultiplier;
+			const hours = (actualInterval / 3600_000).toFixed(1);
+			loopTimer = setTimeout(loop, actualInterval);
+			ctx.ui.notify(`Next review in ${hours} hour(s)`, "info");
+		};
+
 		const loop = async () => {
 			try {
 				if (!loopActive) return;
 
-				// Daily cycle limit
-				const today = new Date().toISOString().slice(0, 10);
-				const stats = readJson<DailyStats>(dailyStatsPath, { date: today, cycleCount: 0 });
-				if (stats.date !== today) {
-					stats.date = today;
-					stats.cycleCount = 0;
-				}
-				if (stats.cycleCount >= LIMITS.maxCyclesPerDay) {
-					ctx.ui.notify(
-						`Daily cycle limit reached (${LIMITS.maxCyclesPerDay}). Waiting until tomorrow.`,
-						"warning",
-					);
+				const blocked = checkSafetyGates();
+				if (blocked) {
+					ctx.ui.notify(blocked, "warning");
+					// Check again in 1 hour (e.g., daily limit may reset at midnight)
 					if (loopActive) loopTimer = setTimeout(loop, 3600_000);
 					return;
 				}
@@ -465,11 +503,10 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 
 				// Only count successful cycles toward daily limit
 				if (consecutiveFailures === prevFailures || consecutiveFailures === 0) {
-					stats.cycleCount++;
-					atomicWriteJson(dailyStatsPath, stats);
+					incrementDailyStats();
 				}
 
-				// Circuit breaker
+				// Circuit breaker (re-check after cycle, since runCycle may have incremented failures)
 				if (consecutiveFailures >= LIMITS.maxConsecutiveFailures) {
 					ctx.ui.notify(
 						`Circuit breaker: ${consecutiveFailures} consecutive failures. Loop stopped. Use /review-start to resume.`,
@@ -479,23 +516,15 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 					return;
 				}
 
-				if (loopActive) {
-					const backoffMultiplier = consecutiveFailures > 0 ? Math.pow(2, consecutiveFailures) : 1;
-					const actualInterval = baseIntervalMs * backoffMultiplier;
-					const hours = (actualInterval / 3600_000).toFixed(1);
-					loopTimer = setTimeout(loop, actualInterval);
-					ctx.ui.notify(`Next review in ${hours} hour(s)`, "info");
-				}
+				scheduleNext();
 			} catch (err: any) {
-				// Catch-all to prevent unhandled promise rejection from the floating loop() call
 				ctx.ui.notify(`Loop error: ${err.message}`, "error");
 				consecutiveFailures++;
 				if (consecutiveFailures >= LIMITS.maxConsecutiveFailures) {
 					loopActive = false;
 					ctx.ui.notify("Circuit breaker triggered from loop error. Loop stopped.", "error");
-				} else if (loopActive) {
-					const backoffMultiplier = Math.pow(2, consecutiveFailures);
-					loopTimer = setTimeout(loop, baseIntervalMs * backoffMultiplier);
+				} else {
+					scheduleNext();
 				}
 			}
 		};
