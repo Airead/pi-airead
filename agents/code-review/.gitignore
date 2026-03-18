@@ -1,0 +1,10 @@
+# Runtime directories
+workspace/
+state/
+
+# Local configuration files
+*.local
+*.local.*
+.env.local
+.env.*.local
+local.*/
