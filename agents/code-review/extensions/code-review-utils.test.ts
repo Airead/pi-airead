@@ -25,6 +25,7 @@ import {
 	createGitHubIssue,
 	detectRepetition,
 	ensureDir,
+	findRelatedFindings,
 	filterValidFindings,
 	incrementDailyStats,
 	isCodeFile,
@@ -719,6 +720,18 @@ describe("buildIssueTitle", () => {
 	it("uses finding defaults correctly", () => {
 		expect(buildIssueTitle(makeFinding())).toBe("[ai-review] bug: Test finding (src/index.ts:1)");
 	});
+
+	it("formats single finding in array same as single finding", () => {
+		const finding = makeFinding({ category: "bug", title: "Null ref", file: "b.ts", line: 10 });
+		expect(buildIssueTitle([finding])).toBe("[ai-review] bug: Null ref (b.ts:10)");
+	});
+
+	it("formats multiple findings with count", () => {
+		const f1 = makeFinding({ category: "security", title: "SQL injection", file: "app.ts", line: 42 });
+		const f2 = makeFinding({ category: "security", title: "XSS", file: "app.ts", line: 80 });
+		const f3 = makeFinding({ category: "security", title: "CSRF", file: "app.ts", line: 100 });
+		expect(buildIssueTitle([f1, f2, f3])).toBe("[ai-review] security: SQL injection (+2 related) (app.ts)");
+	});
 });
 
 // ============================================================================
@@ -896,3 +909,39 @@ describe("detectRepetition", () => {
 		expect(detectRepetition(text, 200, 20, 3)).toBe(false);
 	});
 });
+
+// ============================================================================
+// findRelatedFindings
+// ============================================================================
+
+describe("findRelatedFindings", () => {
+	it("finds findings with same file and category", () => {
+		const target = makeFinding({ file: "a.ts", category: "security", title: "SQL injection" });
+		const related = makeFinding({ file: "a.ts", category: "security", title: "XSS" });
+		const unrelated1 = makeFinding({ file: "b.ts", category: "security", title: "Auth bypass" });
+		const unrelated2 = makeFinding({ file: "a.ts", category: "bug", title: "Null ref" });
+		const cache = [target, related, unrelated1, unrelated2];
+		const result = findRelatedFindings(cache, target);
+		expect(result).toEqual([related]);
+	});
+
+	it("returns empty array when no related findings", () => {
+		const target = makeFinding({ file: "a.ts", category: "security" });
+		const other = makeFinding({ file: "b.ts", category: "bug" });
+		expect(findRelatedFindings([target, other], target)).toEqual([]);
+	});
+
+	it("excludes the target finding itself", () => {
+		const target = makeFinding({ file: "a.ts", category: "security" });
+		expect(findRelatedFindings([target], target)).toEqual([]);
+	});
+
+	it("finds multiple related findings", () => {
+		const target = makeFinding({ file: "a.ts", category: "bug", title: "Bug 1" });
+		const r1 = makeFinding({ file: "a.ts", category: "bug", title: "Bug 2" });
+		const r2 = makeFinding({ file: "a.ts", category: "bug", title: "Bug 3" });
+		const cache = [target, r1, r2];
+		expect(findRelatedFindings(cache, target)).toEqual([r1, r2]);
+	});
+});
+

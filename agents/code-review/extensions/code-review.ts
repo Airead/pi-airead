@@ -20,6 +20,8 @@ import {
 	createGitHubIssue,
 	detectRepetition,
 	ensureDir,
+	findingKey,
+	findRelatedFindings,
 	filterValidFindings,
 	incrementDailyStats,
 	isCodeFile,
@@ -1209,27 +1211,45 @@ IMPORTANT: Do NOT run any gh commands. Only verify the finding against actual co
 			const verifiedFinding = result.finding ?? finding;
 			const details = formatFindingDetails(verifiedFinding).map((l) => `  ${l}`).join("\n");
 			emit(`[Verify] CONFIRMED:\n${details}`);
+
+			// Find related findings in cache (same file + category) to bundle into one issue
+			const related = findRelatedFindings(cache, finding);
+			const allFindings = [verifiedFinding, ...related];
+			if (related.length > 0) {
+				const relatedSummary = related
+					.map((f) => `  [${f.severity}/${f.category}] ${f.title} (${f.file}:${f.line})`)
+					.join("\n");
+				emit(`[Verify] Bundling ${related.length} related finding(s):\n${relatedSummary}`);
+			}
+
 			// Host-side: check for duplicates and create issue
 			const isDuplicate = checkDuplicateIssue(repo, verifiedFinding);
 			if (!isDuplicate) {
-				const issueUrl = createGitHubIssue(repo, verifiedFinding);
+				const issueUrl = createGitHubIssue(repo, allFindings);
 				if (issueUrl) {
-					emit(`[Verify] Issue created: ${issueUrl}`);
+					emit(`[Verify] Issue created (${allFindings.length} finding(s)): ${issueUrl}`);
 				} else {
 					emitWarn("[Verify] Finding verified but issue creation failed");
 				}
 			} else {
 				emit("[Verify] Duplicate found, skipping issue creation");
 			}
+
+			// Remove verified finding + all bundled related findings from cache
+			const cp = statePath("findings-cache.json");
+			assertStateWrite(cp);
+			const removedKeys = new Set([findingKey(finding), ...related.map(findingKey)]);
+			const remainingCache = cache.filter((f) => !removedKeys.has(findingKey(f)));
+			atomicWriteJson(cp, remainingCache);
 		} else {
 			emit(`[Verify] REJECTED: ${result.reason ?? "unknown reason"}\n  was: [${finding.severity}/${finding.category}] ${finding.title} (${finding.file}:${finding.line})`);
-		}
 
-		// Remove processed finding from cache (always remove, whether submitted or rejected)
-		const cp = statePath("findings-cache.json");
-		assertStateWrite(cp);
-		cache.shift();
-		atomicWriteJson(cp, cache);
+			// Remove only the rejected finding from cache
+			const cp = statePath("findings-cache.json");
+			assertStateWrite(cp);
+			cache.shift();
+			atomicWriteJson(cp, cache);
+		}
 	}
 
 	// ========================================================================
