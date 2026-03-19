@@ -381,16 +381,27 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 	const extensionDir = dirname(dirname(currentFile));
 	const skillsDir = join(extensionDir, "skills");
 
-	// State dir is lazily resolved from --review-data-dir flag
-	let _stateDir: string | null = null;
-	function getStateDir(): string {
-		if (!_stateDir) {
-			const dataDir = pi.getFlag("review-data-dir") as string | undefined;
-			if (!dataDir) throw new Error("Missing required --review-data-dir flag");
-			_stateDir = join(dataDir, "state");
-			ensureDir(_stateDir);
+	// Data subdirectories are lazily resolved from --review-data-dir flag
+	function getDataDir(): string {
+		const dataDir = pi.getFlag("review-data-dir") as string | undefined;
+		if (!dataDir) throw new Error("Missing required --review-data-dir flag");
+		return dataDir;
+	}
+
+	const _dataDirs = new Map<string, string>();
+	/** Resolve a subdirectory under --review-data-dir (cached, created on first access). */
+	function getDataSubDir(name: string): string {
+		let dir = _dataDirs.get(name);
+		if (!dir) {
+			dir = join(getDataDir(), name);
+			ensureDir(dir);
+			_dataDirs.set(name, dir);
 		}
-		return _stateDir;
+		return dir;
+	}
+
+	function getStateDir(): string {
+		return getDataSubDir("state");
 	}
 
 	function statePath(name: string): string {
@@ -865,14 +876,28 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 	function formatToolResult(toolName: string, result: any, isError: boolean): string {
 		if (isError) return `ERROR: ${truncate(String(result ?? ""), 150)}`;
 		if (result == null) return "(empty)";
-		const str = typeof result === "string" ? result : JSON.stringify(result);
 		// For read results, show line count instead of dumping content
 		if (toolName === "read" && typeof result === "string") {
-			const lines = result.split("\n").length;
-			const preview = result.split("\n").slice(0, 2).join(" ").trim();
-			return `${lines} lines` + (preview ? ` — ${truncate(preview, 100)}` : "");
+			const lines = result.split("\n");
+			const preview = lines.slice(0, 2).join(" ").trim();
+			return `${lines.length} lines` + (preview ? ` — ${truncate(preview, 100)}` : "");
 		}
+		const str = typeof result === "string" ? result : JSON.stringify(result);
 		return truncate(str, 200);
+	}
+
+	/** Format a finding's key details as display lines. */
+	function formatFindingDetails(f: Finding): string[] {
+		const lines: string[] = [];
+		lines.push(`[${f.severity}/${f.category}] ${f.title} (${f.file}:${f.line}-${f.endLine})`);
+		lines.push(`  ${f.description}`);
+		if (f.codeSnippet) {
+			lines.push(`  code: ${truncate(f.codeSnippet.replace(/\n/g, " "), 120)}`);
+		}
+		if (f.suggestion) {
+			lines.push(`  fix: ${truncate(f.suggestion.replace(/\n/g, " "), 120)}`);
+		}
+		return lines;
 	}
 
 	/** Format token/cost stats as a readable string. */
@@ -924,14 +949,14 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				const turnIn = u.input ?? 0;
 				const turnOut = u.output ?? 0;
 				const turnCacheRead = u.cacheRead ?? 0;
+				const turnCacheWrite = u.cacheWrite ?? 0;
 				const turnCost = u.cost?.total ?? 0;
 				stats.input += turnIn;
 				stats.output += turnOut;
 				stats.cacheRead += turnCacheRead;
-				stats.cacheWrite += u.cacheWrite ?? 0;
+				stats.cacheWrite += turnCacheWrite;
 				stats.cost += turnCost;
 				// Show per-turn token consumption
-				const turnCacheWrite = u.cacheWrite ?? 0;
 				let turnLabel = `${turnIn} in + ${turnOut} out + ${turnCacheRead} cache-read + ${turnCacheWrite} cache-write`;
 				if (turnCost > 0) turnLabel += ` ($${turnCost.toFixed(4)})`;
 				ctx.ui.notify(`[${prefix}] :: turn tokens: ${turnLabel}`, "info");
@@ -941,13 +966,8 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 		return { unsubscribe, getStats: () => stats };
 	}
 
-	/** Resolve sessions directory for persisting sub-agent pi sessions to host. */
 	function getSessionsDir(): string {
-		const dataDir = pi.getFlag("review-data-dir") as string | undefined;
-		if (!dataDir) throw new Error("Missing required --review-data-dir flag");
-		const dir = join(dataDir, "sessions");
-		ensureDir(dir);
-		return dir;
+		return getDataSubDir("sessions");
 	}
 
 	/** Create a container-isolated sub-agent for a given skill. */
@@ -1034,7 +1054,12 @@ Review the file thoroughly and write your findings as a JSON array to the output
 			ctx.ui.notify(`[Review] Discarded ${discarded} malformed finding(s)`, "warning");
 		}
 		if (newFindings.length > 0) {
-			ctx.ui.notify(`[Review] Found ${newFindings.length} issue(s) in ${file}`, "info");
+			ctx.ui.notify(`[Review] Found ${newFindings.length} issue(s) in ${file}:`, "info");
+			for (const f of newFindings) {
+				for (const line of formatFindingDetails(f)) {
+					ctx.ui.notify(`[Review]   ${line}`, "info");
+				}
+			}
 			mergeFindingsCache(newFindings);
 		} else {
 			ctx.ui.notify(`[Review] No issues found in ${file}`, "info");
@@ -1102,13 +1127,17 @@ IMPORTANT: Do NOT run any gh commands. Only verify the finding against actual co
 		const result = readJson<VerifyResult>(statePath("verify-result.json"), { status: "rejected", reason: "No output", finding });
 
 		if (result.status === "submitted") {
-			// Host-side: check for duplicates and create issue
 			const verifiedFinding = result.finding ?? finding;
+			ctx.ui.notify("[Verify] CONFIRMED:", "info");
+			for (const line of formatFindingDetails(verifiedFinding)) {
+				ctx.ui.notify(`[Verify]   ${line}`, "info");
+			}
+			// Host-side: check for duplicates and create issue
 			const isDuplicate = checkDuplicateIssue(repo, verifiedFinding);
 			if (!isDuplicate) {
 				const issueUrl = createGitHubIssue(repo, verifiedFinding);
 				if (issueUrl) {
-					ctx.ui.notify(`[Verify] Issue submitted: ${issueUrl}`, "info");
+					ctx.ui.notify(`[Verify] Issue created: ${issueUrl}`, "info");
 				} else {
 					ctx.ui.notify("[Verify] Finding verified but issue creation failed", "warning");
 				}
@@ -1116,7 +1145,11 @@ IMPORTANT: Do NOT run any gh commands. Only verify the finding against actual co
 				ctx.ui.notify("[Verify] Duplicate found, skipping issue creation", "info");
 			}
 		} else {
-			ctx.ui.notify(`[Verify] Finding rejected: ${result.reason ?? "unknown reason"}`, "info");
+			ctx.ui.notify(`[Verify] REJECTED: ${result.reason ?? "unknown reason"}`, "info");
+			ctx.ui.notify(
+				`[Verify]   was: [${finding.severity}/${finding.category}] ${finding.title} (${finding.file}:${finding.line})`,
+				"info",
+			);
 		}
 
 		// Remove processed finding from cache (always remove, whether submitted or rejected)
