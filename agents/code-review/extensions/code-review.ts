@@ -747,7 +747,9 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				return true;
 			}
 
+			ctx.ui.notify("────────────────────────────────────────", "info");
 			ctx.ui.notify(`Reviewing: ${file}`, "info");
+			ctx.ui.notify("────────────────────────────────────────", "info");
 
 			// Step 2: Review round
 			updateCycleState({ status: "reviewing", file, repo, startedAt: new Date().toISOString() });
@@ -900,17 +902,16 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 		return lines;
 	}
 
-	/** Format token/cost stats as a readable string. */
-	function formatStats(stats: SubAgentStats): string {
-		const parts = [`${stats.toolCalls} tool calls`];
-		const totalTokens = stats.input + stats.output + stats.cacheRead + stats.cacheWrite;
-		if (totalTokens > 0) {
-			parts.push(`tokens: ${stats.input} in + ${stats.output} out + ${stats.cacheRead} cache-read + ${stats.cacheWrite} cache-write`);
-		}
+	/** Emit stats summary as multiple lines to the host UI. */
+	function emitStatsSummary(stats: SubAgentStats, ctx: any, prefix: string): void {
+		ctx.ui.notify(`[${prefix}]   tool calls:  ${stats.toolCalls}`, "info");
+		ctx.ui.notify(`[${prefix}]   input:       ${stats.input} tokens`, "info");
+		ctx.ui.notify(`[${prefix}]   output:      ${stats.output} tokens`, "info");
+		ctx.ui.notify(`[${prefix}]   cache-read:  ${stats.cacheRead} tokens`, "info");
+		ctx.ui.notify(`[${prefix}]   cache-write: ${stats.cacheWrite} tokens`, "info");
 		if (stats.cost > 0) {
-			parts.push(`cost: $${stats.cost.toFixed(4)}`);
+			ctx.ui.notify(`[${prefix}]   cost:        $${stats.cost.toFixed(4)}`, "info");
 		}
-		return parts.join(" | ");
 	}
 
 	/**
@@ -928,19 +929,20 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			if (event.type === "tool_execution_start") {
 				stats.toolCalls++;
 				const argSummary = formatToolArgs(event.toolName, event.args);
-				ctx.ui.notify(
-					`[${prefix}] → ${event.toolName} (${stats.toolCalls}/${LIMITS.maxToolCallsPerSubAgent})${argSummary ? ": " + argSummary : ""}`,
-					"info",
-				);
+				ctx.ui.notify(`[${prefix}] → ${event.toolName} (${stats.toolCalls}/${LIMITS.maxToolCallsPerSubAgent})`, "info");
+				if (argSummary) {
+					ctx.ui.notify(`[${prefix}]   args: ${argSummary}`, "info");
+				}
 				if (stats.toolCalls >= LIMITS.maxToolCallsPerSubAgent) {
-					ctx.ui.notify(`[${prefix}] Tool call limit reached, aborting sub-agent`, "warning");
+					ctx.ui.notify(`[${prefix}]   ⚠ Tool call limit reached, aborting sub-agent`, "warning");
 					client.abort().catch(() => {});
 				}
 			}
 
 			if (event.type === "tool_execution_end") {
 				const resultSummary = formatToolResult(event.toolName, event.result, event.isError);
-				ctx.ui.notify(`[${prefix}] ← ${event.toolName}: ${resultSummary}`, "info");
+				ctx.ui.notify(`[${prefix}] ← ${event.toolName}`, "info");
+				ctx.ui.notify(`[${prefix}]   result: ${resultSummary}`, "info");
 			}
 
 			// Accumulate token usage from assistant messages and show per-turn delta
@@ -957,9 +959,11 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				stats.cacheWrite += turnCacheWrite;
 				stats.cost += turnCost;
 				// Show per-turn token consumption
-				let turnLabel = `${turnIn} in + ${turnOut} out + ${turnCacheRead} cache-read + ${turnCacheWrite} cache-write`;
-				if (turnCost > 0) turnLabel += ` ($${turnCost.toFixed(4)})`;
-				ctx.ui.notify(`[${prefix}] :: turn tokens: ${turnLabel}`, "info");
+				ctx.ui.notify(`[${prefix}] :: turn tokens`, "info");
+				ctx.ui.notify(`[${prefix}]   input: ${turnIn}  output: ${turnOut}  cache-read: ${turnCacheRead}  cache-write: ${turnCacheWrite}`, "info");
+				if (turnCost > 0) {
+					ctx.ui.notify(`[${prefix}]   cost: $${turnCost.toFixed(4)}`, "info");
+				}
 			}
 		});
 
@@ -1044,7 +1048,8 @@ Review the file thoroughly and write your findings as a JSON array to the output
 			await client.stop();
 		}
 
-		ctx.ui.notify(`[Review] Done — ${formatStats(monitor.getStats())}`, "info");
+		ctx.ui.notify(`[Review] Done`, "info");
+		emitStatsSummary(monitor.getStats(), ctx, "Review");
 
 		// Merge new findings into cache (validate sub-agent output)
 		const rawFindings = readJson<unknown[]>(statePath("pending-findings.json"), []);
@@ -1082,7 +1087,10 @@ Review the file thoroughly and write your findings as a JSON array to the output
 
 		// Take the top finding
 		const finding = cache[0];
-		ctx.ui.notify(`[Verify] Checking: ${finding.title} (${finding.file}:${finding.line})`, "info");
+		ctx.ui.notify("────────────────────────────────────────", "info");
+		ctx.ui.notify(`[Verify] Checking: ${finding.title}`, "info");
+		ctx.ui.notify(`[Verify]   file: ${finding.file}:${finding.line}-${finding.endLine}`, "info");
+		ctx.ui.notify(`[Verify]   severity: ${finding.severity}  category: ${finding.category}`, "info");
 
 		// Clean previous output
 		const verifyPath = statePath("verify-result.json");
@@ -1121,7 +1129,8 @@ IMPORTANT: Do NOT run any gh commands. Only verify the finding against actual co
 			await client.stop();
 		}
 
-		ctx.ui.notify(`[Verify] Done — ${formatStats(monitor.getStats())}`, "info");
+		ctx.ui.notify(`[Verify] Done`, "info");
+		emitStatsSummary(monitor.getStats(), ctx, "Verify");
 
 		// Process result — gh operations happen on the host side
 		const result = readJson<VerifyResult>(statePath("verify-result.json"), { status: "rejected", reason: "No output", finding });
