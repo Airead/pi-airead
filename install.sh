@@ -23,16 +23,16 @@ if [ -d "$EXTENSIONS_SRC" ]; then
     if [ -L "$target" ]; then
       existing="$(readlink "$target")"
       if [ "$existing" = "$ext" ]; then
-        echo "  skip: $name (already linked)"
+        echo "  skip: $target (already linked)"
         continue
       fi
-      echo "  update: $name (relink)"
+      echo "  update: $target (relink)"
       rm "$target"
     elif [ -e "$target" ]; then
-      echo "  skip: $name (file exists, not a symlink — remove it manually to install)"
+      echo "  skip: $target (file exists, not a symlink — remove it manually to install)"
       continue
     else
-      echo "  install: $name"
+      echo "  install: $target"
     fi
 
     ln -s "$ext" "$target"
@@ -44,11 +44,10 @@ fi
 
 # --- Install prompts ---
 PROMPTS_SRC="$SCRIPT_DIR/prompts"
-PROMPTS_DST="$AGENT_DST/prompts"
+PROMPTS_DST="$AGENT_DST"
 
 if [ -d "$PROMPTS_SRC" ]; then
   echo "Prompts:"
-  mkdir -p "$PROMPTS_DST"
 
   for prompt in "$PROMPTS_SRC"/*.md; do
     [ -f "$prompt" ] || continue
@@ -58,16 +57,16 @@ if [ -d "$PROMPTS_SRC" ]; then
     if [ -L "$target" ]; then
       existing="$(readlink "$target")"
       if [ "$existing" = "$prompt" ]; then
-        echo "  skip: $name (already linked)"
+        echo "  skip: $target (already linked)"
         continue
       fi
-      echo "  update: $name (relink)"
+      echo "  update: $target (relink)"
       rm "$target"
     elif [ -e "$target" ]; then
-      echo "  skip: $name (file exists, not a symlink — remove it manually to install)"
+      echo "  skip: $target (file exists, not a symlink — remove it manually to install)"
       continue
     else
-      echo "  install: $name"
+      echo "  install: $target"
     fi
 
     ln -s "$prompt" "$target"
@@ -81,5 +80,5 @@ fi
 if [ "$installed" -eq 0 ]; then
   echo "Nothing to install. Everything is up to date."
 else
-  echo "Installed $installed file(s) to $AGENT_DST"
+  echo "Installed $installed file(s)."
 fi
