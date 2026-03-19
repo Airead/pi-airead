@@ -3,6 +3,46 @@ import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileS
 import { dirname, resolve } from "node:path";
 
 // ============================================================================
+// Repetition Detection
+// ============================================================================
+
+/**
+ * Detect consecutive repeating patterns at the tail of text.
+ * Ported from VoiceText's repetition.py — prevents LLM output loops.
+ *
+ * Shorter patterns require more repeats (scaled so total repeated length >= minRepeatedChars).
+ * E.g., a 1-char pattern needs 20 repeats; a 5-char pattern needs 4 repeats.
+ */
+export function detectRepetition(
+	text: string,
+	checkWindow = 200,
+	minRepeatedChars = 20,
+	minRepeats = 4,
+): boolean {
+	if (text.length < minRepeatedChars) return false;
+	const tail = text.length > checkWindow ? text.slice(-checkWindow) : text;
+	const maxPatLen = Math.floor(tail.length / minRepeats);
+	for (let patLen = 1; patLen <= maxPatLen; patLen++) {
+		const needed = Math.max(minRepeats, Math.floor(minRepeatedChars / patLen));
+		if (patLen * needed > tail.length) continue;
+
+		const pattern = tail.slice(-patLen);
+		if (pattern.trim().length === 0) continue;
+
+		let matched = true;
+		for (let i = 1; i < needed; i++) {
+			const start = tail.length - patLen * (i + 1);
+			if (start < 0 || tail.slice(start, start + patLen) !== pattern) {
+				matched = false;
+				break;
+			}
+		}
+		if (matched) return true;
+	}
+	return false;
+}
+
+// ============================================================================
 // Types
 // ============================================================================
 

@@ -18,6 +18,7 @@ import {
 	checkSafetyGates,
 	cleanupOldSessions,
 	createGitHubIssue,
+	detectRepetition,
 	ensureDir,
 	filterValidFindings,
 	incrementDailyStats,
@@ -944,9 +945,16 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 	): { unsubscribe: () => void; getStats: () => SubAgentStats } {
 		const stats: SubAgentStats = { toolCalls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
 
-		// Buffer for streaming text deltas — flush every FLUSH_THRESHOLD chars
+		// Display buffer for text_delta only — flush every FLUSH_THRESHOLD chars
 		const FLUSH_THRESHOLD = 500;
 		let textBuffer = "";
+
+		// Repetition detection — separate window for text_delta + toolcall_delta
+		const REP_CHECK_WINDOW = 200;
+		const REP_CHECK_INTERVAL = 200;
+		let repetitionWindow = "";
+		let charsSinceRepCheck = 0;
+		let aborted = false;
 
 		function flushTextBuffer(): void {
 			if (textBuffer.length > 0) {
@@ -974,31 +982,65 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				emit(`[${prefix}] ← ${event.toolName}\n  result: ${resultSummary}`);
 			}
 
-			// Stream model text generation so user can see what the agent is thinking/writing
-			if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
-				textBuffer += event.assistantMessageEvent.delta;
-				if (textBuffer.length >= FLUSH_THRESHOLD) {
-					flushTextBuffer();
+			// Stream deltas and detect repetition (skip if already aborted)
+			if (event.type === "message_update" && !aborted) {
+				const sub = event.assistantMessageEvent;
+				if (sub?.type === "text_delta") {
+					textBuffer += sub.delta;
+					repetitionWindow += sub.delta;
+				} else if (sub?.type === "toolcall_delta") {
+					repetitionWindow += sub.delta; // detection only, no display
+				}
+
+				if (sub?.type === "text_delta" || sub?.type === "toolcall_delta") {
+					// Trim repetition window to check_window size
+					if (repetitionWindow.length > REP_CHECK_WINDOW) {
+						repetitionWindow = repetitionWindow.slice(-REP_CHECK_WINDOW);
+					}
+
+					// Flush display buffer periodically
+					if (textBuffer.length >= FLUSH_THRESHOLD) {
+						flushTextBuffer();
+					}
+
+					// Check for repetition periodically
+					charsSinceRepCheck += sub.delta.length;
+					if (charsSinceRepCheck >= REP_CHECK_INTERVAL) {
+						charsSinceRepCheck = 0;
+						if (detectRepetition(repetitionWindow)) {
+							flushTextBuffer();
+							emitWarn(`[${prefix}] Repetition detected in output, aborting sub-agent to save tokens`);
+							aborted = true;
+							repetitionWindow = "";
+							charsSinceRepCheck = 0;
+							client.abort().catch(() => {});
+						}
+					}
 				}
 			}
 
 			// Accumulate token usage from assistant messages and show per-turn delta
-			if (event.type === "message_end" && event.message?.role === "assistant" && event.message?.usage) {
+			// Always processed (even after abort) to preserve stats
+			if (event.type === "message_end" && event.message?.role === "assistant") {
 				flushTextBuffer();
-				const u = event.message.usage;
-				const turnIn = u.input ?? 0;
-				const turnOut = u.output ?? 0;
-				const turnCacheRead = u.cacheRead ?? 0;
-				const turnCacheWrite = u.cacheWrite ?? 0;
-				const turnCost = u.cost?.total ?? 0;
-				stats.input += turnIn;
-				stats.output += turnOut;
-				stats.cacheRead += turnCacheRead;
-				stats.cacheWrite += turnCacheWrite;
-				stats.cost += turnCost;
-				let msg = `[${prefix}] :: turn tokens\n  input: ${turnIn}  output: ${turnOut}  cache-read: ${turnCacheRead}  cache-write: ${turnCacheWrite}`;
-				if (turnCost > 0) msg += `\n  cost: $${turnCost.toFixed(4)}`;
-				emit(msg);
+				repetitionWindow = "";
+				charsSinceRepCheck = 0;
+				if (event.message.usage) {
+					const u = event.message.usage;
+					const turnIn = u.input ?? 0;
+					const turnOut = u.output ?? 0;
+					const turnCacheRead = u.cacheRead ?? 0;
+					const turnCacheWrite = u.cacheWrite ?? 0;
+					const turnCost = u.cost?.total ?? 0;
+					stats.input += turnIn;
+					stats.output += turnOut;
+					stats.cacheRead += turnCacheRead;
+					stats.cacheWrite += turnCacheWrite;
+					stats.cost += turnCost;
+					let msg = `[${prefix}] :: turn tokens\n  input: ${turnIn}  output: ${turnOut}  cache-read: ${turnCacheRead}  cache-write: ${turnCacheWrite}`;
+					if (turnCost > 0) msg += `\n  cost: $${turnCost.toFixed(4)}`;
+					emit(msg);
+				}
 			}
 		});
 

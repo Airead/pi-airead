@@ -23,6 +23,7 @@ import {
 	checkSafetyGates,
 	cleanupOldSessions,
 	createGitHubIssue,
+	detectRepetition,
 	ensureDir,
 	filterValidFindings,
 	incrementDailyStats,
@@ -822,5 +823,76 @@ describe("createGitHubIssue", () => {
 		const titleIdx = capturedArgs.indexOf("--title");
 		expect(titleIdx).toBeGreaterThan(-1);
 		expect(capturedArgs[titleIdx + 1]).toBe("[ai-review] security: SQL injection (app.ts:42)");
+	});
+});
+
+// ============================================================================
+// detectRepetition
+// ============================================================================
+
+describe("detectRepetition", () => {
+	it("returns false for normal text", () => {
+		expect(detectRepetition("This is a normal code review finding about SQL injection.")).toBe(false);
+	});
+
+	it("returns false for empty text", () => {
+		expect(detectRepetition("")).toBe(false);
+	});
+
+	it("returns false for short text", () => {
+		expect(detectRepetition("hello")).toBe(false);
+	});
+
+	it("detects single character repeated 20+ times", () => {
+		expect(detectRepetition("normal text" + "x".repeat(20))).toBe(true);
+	});
+
+	it("does not trigger for single character below threshold", () => {
+		expect(detectRepetition("normal text" + "x".repeat(10))).toBe(false);
+	});
+
+	it("detects short pattern (3 chars) repeated 7+ times", () => {
+		expect(detectRepetition("prefix" + "abc".repeat(7))).toBe(true);
+	});
+
+	it("does not trigger for short pattern below threshold", () => {
+		expect(detectRepetition("prefix" + "abc".repeat(3))).toBe(false);
+	});
+
+	it("detects 5-char pattern repeated 4+ times", () => {
+		expect(detectRepetition("prefix" + "hello".repeat(5))).toBe(true);
+	});
+
+	it("detects longer pattern repeated 4 times", () => {
+		const pattern = "the code has a bug ";
+		expect(detectRepetition("start " + pattern.repeat(4))).toBe(true);
+	});
+
+	it("does not trigger for whitespace-only patterns", () => {
+		expect(detectRepetition("some text" + " ".repeat(50))).toBe(false);
+	});
+
+	it("only checks the last check_window characters", () => {
+		// Repetition is far from the tail — should not detect
+		const text = "x".repeat(25) + "a".repeat(300);
+		expect(detectRepetition(text, 200)).toBe(true); // "a" repeats in the window
+		// But with a very short window, "a" repetition is detected within any window
+		expect(detectRepetition("y".repeat(25) + "normal text that is long enough", 200)).toBe(false);
+	});
+
+	it("detects JSON-like repetition in tool call output", () => {
+		const fragment = '{"file":"a.ts","line":1},';
+		expect(detectRepetition("prefix" + fragment.repeat(4))).toBe(true);
+	});
+
+	it("does not false-positive on similar but different JSON entries", () => {
+		const text = '{"file":"a.ts","line":1},{"file":"b.ts","line":2},{"file":"c.ts","line":3},{"file":"d.ts","line":4}';
+		expect(detectRepetition(text)).toBe(false);
+	});
+
+	it("supports custom thresholds", () => {
+		const text = "abc".repeat(5); // 15 chars
+		expect(detectRepetition(text, 200, 10, 3)).toBe(true);
+		expect(detectRepetition(text, 200, 20, 3)).toBe(false);
 	});
 });
