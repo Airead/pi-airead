@@ -169,14 +169,13 @@ export REVIEW_API_KEY="$API_KEY_VALUE"
 # Prepare directories
 # --------------------------------------------------------------------------
 
-STATE_DIR="$DATA_DIR/state"
-WORKSPACE_DIR="$DATA_DIR/workspace"
 REPO_NAME="${REPO//\//_}"
-REPO_DIR="$WORKSPACE_DIR/$REPO_NAME"
+DATA_DIR="$DATA_DIR/$REPO_NAME"
+STATE_DIR="$DATA_DIR/state"
+REPO_DIR="$DATA_DIR/repo"
 MAX_REPO_SIZE_MB=500
 
 mkdir -p "$STATE_DIR"
-mkdir -p "$WORKSPACE_DIR"
 
 # --------------------------------------------------------------------------
 # Ensure Docker image is built
