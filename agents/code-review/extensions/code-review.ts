@@ -51,9 +51,9 @@ export const LIMITS = {
 	/** Max tool calls per sub-agent before abort */
 	maxToolCallsPerSubAgent: 50,
 	/** Review sub-agent timeout (ms) */
-	reviewTimeoutMs: 300_000,
+	reviewTimeoutMs: 600_000,
 	/** Verify sub-agent timeout (ms) */
-	verifyTimeoutMs: 180_000,
+	verifyTimeoutMs: 300_000,
 	/** Stop loop after N consecutive failures */
 	maxConsecutiveFailures: 5,
 	/** Delete session files older than N days */
@@ -944,8 +944,20 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 	): { unsubscribe: () => void; getStats: () => SubAgentStats } {
 		const stats: SubAgentStats = { toolCalls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
 
+		// Buffer for streaming text deltas — flush every FLUSH_THRESHOLD chars
+		const FLUSH_THRESHOLD = 500;
+		let textBuffer = "";
+
+		function flushTextBuffer(): void {
+			if (textBuffer.length > 0) {
+				emit(`[${prefix}] ... ${truncate(textBuffer.trim(), 500)}`);
+				textBuffer = "";
+			}
+		}
+
 		const unsubscribe = client.onEvent((event: any) => {
 			if (event.type === "tool_execution_start") {
+				flushTextBuffer();
 				stats.toolCalls++;
 				const argSummary = formatToolArgs(event.toolName, event.args);
 				let msg = `[${prefix}] → ${event.toolName} (${stats.toolCalls}/${LIMITS.maxToolCallsPerSubAgent})`;
@@ -962,8 +974,17 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				emit(`[${prefix}] ← ${event.toolName}\n  result: ${resultSummary}`);
 			}
 
+			// Stream model text generation so user can see what the agent is thinking/writing
+			if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
+				textBuffer += event.assistantMessageEvent.delta;
+				if (textBuffer.length >= FLUSH_THRESHOLD) {
+					flushTextBuffer();
+				}
+			}
+
 			// Accumulate token usage from assistant messages and show per-turn delta
 			if (event.type === "message_end" && event.message?.role === "assistant" && event.message?.usage) {
+				flushTextBuffer();
 				const u = event.message.usage;
 				const turnIn = u.input ?? 0;
 				const turnOut = u.output ?? 0;
