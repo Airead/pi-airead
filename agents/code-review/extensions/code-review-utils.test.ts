@@ -244,10 +244,19 @@ describe("isCodeFile", () => {
 		expect(isCodeFile("src/api.generated.ts")).toBe(false);
 	});
 
+	it("excludes test files", () => {
+		expect(isCodeFile("tests/unit/parser.test.ts")).toBe(false);
+		expect(isCodeFile("src/utils.spec.js")).toBe(false);
+		expect(isCodeFile("__tests__/app.tsx")).toBe(false);
+		expect(isCodeFile("test_helpers.py")).toBe(false);
+		expect(isCodeFile("tests/conftest.py")).toBe(false);
+		expect(isCodeFile("src/components/Button_test.go")).toBe(false);
+	});
+
 	it("accepts files in normal paths", () => {
 		expect(isCodeFile("src/components/Button.tsx")).toBe(true);
-		expect(isCodeFile("tests/unit/parser.test.ts")).toBe(true);
 		expect(isCodeFile("packages/core/index.ts")).toBe(true);
+		expect(isCodeFile("lib/contest.py")).toBe(true);
 	});
 });
 

@@ -154,6 +154,10 @@ export function isCodeFile(file: string): boolean {
 		"node_modules/", "vendor/", "dist/", "build/",
 		".min.", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
 		"__snapshots__/", ".generated.", "/generated/",
+		// Test files
+		".test.", ".spec.", "_test.", "_spec.",
+		"__tests__/", "__test__/", "/test/", "/tests/",
+		"conftest.py", "test_", "tests/",
 	];
 	return !excludePatterns.some((p) => file.includes(p));
 }
