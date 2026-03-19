@@ -8,6 +8,45 @@ import { existsSync, readdirSync } from "node:fs";
 import { networkInterfaces, platform } from "node:os";
 import { basename, join } from "node:path";
 
+// ============================================================================
+// Provider Configuration
+// ============================================================================
+
+/** Provider-specific configuration for container environment. */
+export interface ProviderConfig {
+	/** Provider name (e.g., "anthropic", "zai", "openai") */
+	provider: string;
+	/** Model ID (e.g., "glm-5", "claude-opus-4-6") */
+	model?: string;
+	/** API key to pass to sub-agents (for non-anthropic providers) */
+	apiKey?: string;
+}
+
+/**
+ * Map of known providers to their API key environment variable names.
+ * NOTE: launch.sh has a parallel mapping in resolve_api_key_env() — keep in sync.
+ */
+export const PROVIDER_API_KEY_ENV: Record<string, string> = {
+	anthropic: "ANTHROPIC_API_KEY",
+	zai: "ZAI_API_KEY",
+	openai: "OPENAI_API_KEY",
+	google: "GEMINI_API_KEY",
+	groq: "GROQ_API_KEY",
+	xai: "XAI_API_KEY",
+	cerebras: "CEREBRAS_API_KEY",
+	openrouter: "OPENROUTER_API_KEY",
+	mistral: "MISTRAL_API_KEY",
+	minimax: "MINIMAX_API_KEY",
+	"minimax-cn": "MINIMAX_CN_API_KEY",
+	huggingface: "HF_TOKEN",
+	kimi: "KIMI_API_KEY",
+};
+
+/** Resolve the API key env var name for a given provider. */
+export function resolveApiKeyEnvVar(provider: string): string {
+	return PROVIDER_API_KEY_ENV[provider] ?? `${provider.toUpperCase().replace(/-/g, "_")}_API_KEY`;
+}
+
 /** The container runtime binary name. */
 export const CONTAINER_RUNTIME_BIN = "docker";
 
@@ -138,6 +177,9 @@ export function findEnvFiles(dir: string): string[] {
 
 /**
  * Build docker run args for a container-isolated sub-agent.
+ *
+ * For anthropic provider: uses credential proxy (container gets placeholder key + proxy URL).
+ * For other providers: passes real API key via --api-key in piCommand (container accesses provider directly).
  */
 export function buildContainerArgs(options: {
 	containerName: string;
@@ -145,9 +187,11 @@ export function buildContainerArgs(options: {
 	stateDir: string;
 	skillDirs: string[];
 	piCommand: string[];
+	providerConfig?: ProviderConfig;
 }): string[] {
-	const { containerName, repoDir, stateDir, skillDirs, piCommand } = options;
+	const { containerName, repoDir, stateDir, skillDirs, piCommand, providerConfig } = options;
 	const gateway = CONTAINER_HOST_GATEWAY;
+	const isAnthropicProxy = !providerConfig || providerConfig.provider === "anthropic";
 
 	const args: string[] = [
 		"run",
@@ -165,11 +209,17 @@ export function buildContainerArgs(options: {
 		...writableMountArgs(stateDir, CONTAINER_PATHS.state),
 		// Read-only skills
 		...skillDirs.flatMap((s) => readonlyMountArgs(s, CONTAINER_PATHS.skill(basename(s)))),
-		// Credential proxy (no real keys in container)
-		"-e",
-		`ANTHROPIC_BASE_URL=http://${gateway}:${CREDENTIAL_PROXY_PORT}`,
-		"-e",
-		"ANTHROPIC_API_KEY=placeholder",
+	];
+
+	if (isAnthropicProxy) {
+		// Anthropic: route through credential proxy (no real keys in container)
+		args.push("-e", `ANTHROPIC_BASE_URL=http://${gateway}:${CREDENTIAL_PROXY_PORT}`);
+		args.push("-e", "ANTHROPIC_API_KEY=placeholder");
+	}
+	// Non-anthropic: real API key is passed via --api-key in piCommand (not env vars).
+	// Container needs internet access to reach the provider API directly.
+
+	args.push(
 		// Disable git hooks
 		"-e",
 		"GIT_CONFIG_NOSYSTEM=1",
@@ -184,7 +234,7 @@ export function buildContainerArgs(options: {
 		CONTAINER_IMAGE,
 		// Command
 		...piCommand,
-	];
+	);
 
 	return args;
 }

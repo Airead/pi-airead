@@ -11,7 +11,9 @@ import {
 	findEnvFiles,
 	hostGatewayArgs,
 	piCliPathInContainer,
+	PROVIDER_API_KEY_ENV,
 	readonlyMountArgs,
+	resolveApiKeyEnvVar,
 	writableMountArgs,
 } from "./container-runtime.js";
 
@@ -128,7 +130,7 @@ describe("findEnvFiles", () => {
 // ============================================================================
 
 describe("buildContainerArgs", () => {
-	it("builds correct docker run args", () => {
+	it("builds correct docker run args with anthropic proxy (default)", () => {
 		const skillDir = join(testDir, "review");
 		mkdirSync(skillDir, { recursive: true });
 
@@ -137,7 +139,7 @@ describe("buildContainerArgs", () => {
 			repoDir: "/host/repo",
 			stateDir: "/host/state",
 			skillDirs: [skillDir],
-					piCommand: ["node", "/usr/local/lib/node_modules/pi/cli.js", "--mode", "rpc"],
+			piCommand: ["node", "/usr/local/lib/node_modules/pi/cli.js", "--mode", "rpc"],
 		});
 
 		expect(args[0]).toBe("run");
@@ -158,13 +160,47 @@ describe("buildContainerArgs", () => {
 		const stateMountIdx = args.findIndex((a) => a === "/host/state:/workspace/state");
 		expect(stateMountIdx).toBeGreaterThan(-1);
 
-		// Check env vars
-		// Check credential proxy env vars
+		// Check credential proxy env vars (default = anthropic)
 		const baseUrlArg = args.find((a) => a.startsWith("ANTHROPIC_BASE_URL="));
 		expect(baseUrlArg).toBeDefined();
 		expect(baseUrlArg).toContain(CONTAINER_HOST_GATEWAY);
 		expect(args).toContain("ANTHROPIC_API_KEY=placeholder");
 		expect(args).toContain("GIT_CONFIG_NOSYSTEM=1");
+	});
+
+	it("builds correct docker run args with explicit anthropic provider", () => {
+		const args = buildContainerArgs({
+			containerName: "test",
+			repoDir: "/host/repo",
+			stateDir: "/host/state",
+			skillDirs: [],
+			piCommand: ["echo"],
+			providerConfig: { provider: "anthropic" },
+		});
+
+		// Anthropic should use proxy env vars
+		expect(args).toContain("ANTHROPIC_API_KEY=placeholder");
+		expect(args.find((a) => a.startsWith("ANTHROPIC_BASE_URL="))).toBeDefined();
+	});
+
+	it("omits anthropic env vars for non-anthropic provider", () => {
+		const args = buildContainerArgs({
+			containerName: "test",
+			repoDir: "/host/repo",
+			stateDir: "/host/state",
+			skillDirs: [],
+			piCommand: ["node", "cli.js", "--mode", "rpc", "--provider", "zai", "--api-key", "test-key"],
+			providerConfig: { provider: "zai", model: "glm-5", apiKey: "test-key" },
+		});
+
+		// Should NOT have anthropic proxy env vars
+		expect(args).not.toContain("ANTHROPIC_API_KEY=placeholder");
+		expect(args.find((a) => a.startsWith("ANTHROPIC_BASE_URL="))).toBeUndefined();
+		// Should still have GIT_CONFIG_NOSYSTEM
+		expect(args).toContain("GIT_CONFIG_NOSYSTEM=1");
+		// piCommand should contain provider/model/api-key args
+		expect(args).toContain("--provider");
+		expect(args).toContain("zai");
 	});
 
 	it("shadows .env files with /dev/null", () => {
@@ -180,7 +216,7 @@ describe("buildContainerArgs", () => {
 			repoDir,
 			stateDir: "/host/state",
 			skillDirs: [],
-					piCommand: ["echo"],
+			piCommand: ["echo"],
 		});
 
 		// Should have --mount args for .env files
@@ -201,13 +237,45 @@ describe("buildContainerArgs", () => {
 			repoDir: "/host/repo",
 			stateDir: "/host/state",
 			skillDirs: [skill1, skill2],
-					piCommand: ["echo"],
+			piCommand: ["echo"],
 		});
 
 		const skillMounts = args.filter((a) => a.includes("/workspace/skills/"));
 		expect(skillMounts.length).toBe(2);
 		expect(skillMounts.some((a) => a.includes("/workspace/skills/review:ro"))).toBe(true);
 		expect(skillMounts.some((a) => a.includes("/workspace/skills/verify:ro"))).toBe(true);
+	});
+});
+
+// ============================================================================
+// resolveApiKeyEnvVar
+// ============================================================================
+
+describe("resolveApiKeyEnvVar", () => {
+	it("returns known provider env vars", () => {
+		expect(resolveApiKeyEnvVar("anthropic")).toBe("ANTHROPIC_API_KEY");
+		expect(resolveApiKeyEnvVar("zai")).toBe("ZAI_API_KEY");
+		expect(resolveApiKeyEnvVar("openai")).toBe("OPENAI_API_KEY");
+		expect(resolveApiKeyEnvVar("google")).toBe("GEMINI_API_KEY");
+		expect(resolveApiKeyEnvVar("huggingface")).toBe("HF_TOKEN");
+	});
+
+	it("falls back to PROVIDER_API_KEY for unknown providers", () => {
+		expect(resolveApiKeyEnvVar("custom")).toBe("CUSTOM_API_KEY");
+		expect(resolveApiKeyEnvVar("my-provider")).toBe("MY_PROVIDER_API_KEY");
+	});
+});
+
+// ============================================================================
+// PROVIDER_API_KEY_ENV
+// ============================================================================
+
+describe("PROVIDER_API_KEY_ENV", () => {
+	it("contains entries for common providers", () => {
+		expect(PROVIDER_API_KEY_ENV).toHaveProperty("anthropic");
+		expect(PROVIDER_API_KEY_ENV).toHaveProperty("zai");
+		expect(PROVIDER_API_KEY_ENV).toHaveProperty("openai");
+		expect(PROVIDER_API_KEY_ENV).toHaveProperty("google");
 	});
 });
 

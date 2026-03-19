@@ -2,9 +2,39 @@
 set -euo pipefail
 
 # Code Review Agent Launcher
-# Usage: ./launch.sh --repo <owner/repo> --data-dir <path> [--interval <hours>]
+# Usage: ./launch.sh --repo <owner/repo> --data-dir <path> [--interval <hours>] [--provider <name>] [--model <id>]
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# --------------------------------------------------------------------------
+# Provider → API key env var mapping
+# --------------------------------------------------------------------------
+
+# NOTE: container-runtime.ts has a parallel mapping in PROVIDER_API_KEY_ENV — keep in sync.
+resolve_api_key_env() {
+    local provider="$1"
+    case "$provider" in
+        anthropic)  echo "ANTHROPIC_API_KEY" ;;
+        zai)        echo "ZAI_API_KEY" ;;
+        openai)     echo "OPENAI_API_KEY" ;;
+        google)     echo "GEMINI_API_KEY" ;;
+        groq)       echo "GROQ_API_KEY" ;;
+        xai)        echo "XAI_API_KEY" ;;
+        cerebras)   echo "CEREBRAS_API_KEY" ;;
+        openrouter) echo "OPENROUTER_API_KEY" ;;
+        mistral)    echo "MISTRAL_API_KEY" ;;
+        minimax)    echo "MINIMAX_API_KEY" ;;
+        minimax-cn) echo "MINIMAX_CN_API_KEY" ;;
+        huggingface) echo "HF_TOKEN" ;;
+        kimi)       echo "KIMI_API_KEY" ;;
+        *)
+            # Fallback: PROVIDER_API_KEY (uppercase, dashes to underscores)
+            local upper
+            upper="$(echo "$provider" | tr '[:lower:]-' '[:upper:]_')"
+            echo "${upper}_API_KEY"
+            ;;
+    esac
+}
 
 # --------------------------------------------------------------------------
 # Parse arguments
@@ -13,10 +43,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO=""
 DATA_DIR=""
 INTERVAL="1"
+PROVIDER=""
+MODEL=""
 
 usage() {
     cat <<EOF
-Usage: $0 --repo <owner/repo> --data-dir <path> [--interval <hours>]
+Usage: $0 --repo <owner/repo> --data-dir <path> [options]
 
 Required:
   --repo <owner/repo>    GitHub repository to review (e.g., facebook/react)
@@ -24,6 +56,8 @@ Required:
 
 Optional:
   --interval <hours>     Hours between review cycles (default: 1)
+  --provider <name>      AI provider (default: anthropic). e.g., zai, openai, google
+  --model <id>           Model ID. e.g., glm-5, gpt-5.4
   --help                 Show this help message
 EOF
     exit "${1:-0}"
@@ -47,6 +81,12 @@ while [ $# -gt 0 ]; do
         --interval)
             require_arg "$@"
             INTERVAL="$2"; shift 2 ;;
+        --provider)
+            require_arg "$@"
+            PROVIDER="$2"; shift 2 ;;
+        --model)
+            require_arg "$@"
+            MODEL="$2"; shift 2 ;;
         --help|-h)
             usage 0 ;;
         *)
@@ -64,6 +104,9 @@ if [ -z "$DATA_DIR" ]; then
     echo "Error: --data-dir is required"
     usage 1
 fi
+
+# Default provider
+PROVIDER="${PROVIDER:-anthropic}"
 
 # Resolve to absolute path before any cd
 mkdir -p "$DATA_DIR"
@@ -106,10 +149,17 @@ if ! docker info &>/dev/null 2>&1; then
     exit 1
 fi
 
-if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-    echo "Error: ANTHROPIC_API_KEY environment variable is required for credential proxy."
+# Check API key for the specified provider
+API_KEY_ENV="$(resolve_api_key_env "$PROVIDER")"
+API_KEY_VALUE="${!API_KEY_ENV:-}"
+
+if [ -z "$API_KEY_VALUE" ]; then
+    echo "Error: $API_KEY_ENV environment variable is required for provider '$PROVIDER'."
     exit 1
 fi
+
+# Export API key as REVIEW_API_KEY for the extension to read (provider-agnostic)
+export REVIEW_API_KEY="$API_KEY_VALUE"
 
 # --------------------------------------------------------------------------
 # Prepare directories
@@ -176,18 +226,33 @@ fi
 echo ""
 echo "Starting code review agent..."
 echo "  Repository:  $REPO"
+echo "  Provider:    $PROVIDER"
+echo "  Model:       ${MODEL:-<default>}"
 echo "  Data dir:    $DATA_DIR"
 echo "  Interval:    ${INTERVAL} hour(s)"
 echo ""
 
 cd "$REPO_DIR"
 
-exec pi \
-    --append-system-prompt "$SCRIPT_DIR/prompts/APPEND_SYSTEM.md" \
-    --append-system-prompt "$SCRIPT_DIR/prompts/agents.md" \
-    -e "$SCRIPT_DIR/extensions/code-review.ts" \
-    --skill "$SCRIPT_DIR/skills/review" \
-    --skill "$SCRIPT_DIR/skills/verify" \
-    --review-repo "$REPO" \
-    --review-interval "$INTERVAL" \
+# Build pi command with optional provider/model flags
+PI_ARGS=(
+    --append-system-prompt "$SCRIPT_DIR/prompts/APPEND_SYSTEM.md"
+    --append-system-prompt "$SCRIPT_DIR/prompts/agents.md"
+    -e "$SCRIPT_DIR/extensions/code-review.ts"
+    --skill "$SCRIPT_DIR/skills/review"
+    --skill "$SCRIPT_DIR/skills/verify"
+    --review-repo "$REPO"
+    --review-interval "$INTERVAL"
     --review-data-dir "$DATA_DIR"
+    --review-provider "$PROVIDER"
+)
+
+# Pass --provider and --model to pi (built-in flags for the host process)
+PI_ARGS+=(--provider "$PROVIDER")
+
+if [ -n "$MODEL" ]; then
+    PI_ARGS+=(--model "$MODEL")
+    PI_ARGS+=(--review-model "$MODEL")
+fi
+
+exec pi "${PI_ARGS[@]}"

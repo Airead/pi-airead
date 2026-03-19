@@ -37,6 +37,7 @@ import {
 	piCliPathInContainer,
 	stopContainer,
 	detectProxyBindHost,
+	type ProviderConfig,
 } from "./container-runtime.js";
 import { CREDENTIAL_PROXY_PORT, startCredentialProxy, stopCredentialProxy } from "./credential-proxy.js";
 
@@ -69,6 +70,7 @@ export interface ContainerModeOptions {
 	repoDir: string;
 	stateDir: string;
 	skillDirs: string[];
+	providerConfig?: ProviderConfig;
 }
 
 class SubAgentClient {
@@ -99,7 +101,7 @@ class SubAgentClient {
 		const args = ["--mode", "rpc", ...(this.options.args ?? [])];
 
 		if (this.options.containerMode) {
-			const { repoDir, stateDir, skillDirs } = this.options.containerMode;
+			const { repoDir, stateDir, skillDirs, providerConfig } = this.options.containerMode;
 			this.containerName = `code-review-${Date.now()}`;
 
 			const dockerArgs = buildContainerArgs({
@@ -108,6 +110,7 @@ class SubAgentClient {
 				stateDir,
 				skillDirs,
 				piCommand: ["node", piCliPathInContainer(), ...args],
+				providerConfig,
 			});
 
 			this.process = spawn("docker", dockerArgs, {
@@ -417,6 +420,41 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 		description: "Directory for runtime data (state/ and workspace/)",
 		type: "string",
 	});
+	pi.registerFlag("review-provider", {
+		description: "AI provider for sub-agents (default: anthropic)",
+		type: "string",
+	});
+	pi.registerFlag("review-model", {
+		description: "Model ID for sub-agents",
+		type: "string",
+	});
+
+	/** Cached provider config, resolved once at session start. */
+	let _providerConfig: ProviderConfig | null = null;
+
+	/** Resolve provider config from flags and environment (cached after first call). */
+	function getProviderConfig(): ProviderConfig {
+		if (!_providerConfig) {
+			const provider = (pi.getFlag("review-provider") as string | undefined) ?? "anthropic";
+			const model = pi.getFlag("review-model") as string | undefined;
+			const apiKey = process.env.REVIEW_API_KEY;
+			_providerConfig = { provider, model, apiKey };
+		}
+		return _providerConfig;
+	}
+
+	/** Build common sub-agent CLI args with provider/model flags. */
+	function buildSubAgentArgs(skillName: string, config: ProviderConfig): string[] {
+		const args = ["--skill", CONTAINER_PATHS.skill(skillName), "--no-extensions"];
+		args.push("--provider", config.provider);
+		if (config.model) {
+			args.push("--model", config.model);
+		}
+		if (config.provider !== "anthropic" && config.apiKey) {
+			args.push("--api-key", config.apiKey);
+		}
+		return args;
+	}
 
 	/** Returns repo+dataDir or shows errors and returns null. */
 	function requireFlags(ctx: any): { repo: string; dataDir: string } | null {
@@ -519,29 +557,36 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 		const repo = pi.getFlag("review-repo") as string | undefined;
 		const dataDir = pi.getFlag("review-data-dir") as string | undefined;
 		if (repo && dataDir) {
+			const config = getProviderConfig();
+			const useProxy = config.provider === "anthropic";
 			try {
 				// Initialize container infrastructure
 				// ensureRuntimeRunning() is omitted — launch.sh already checked Docker,
 				// and ensureImageBuilt() will fail with a clear error if Docker is down.
 				cleanupOrphans();
 				ensureImageBuilt(join(extensionDir, "container"));
-				const proxyHost = detectProxyBindHost();
-				proxyServer = await startCredentialProxy(CREDENTIAL_PROXY_PORT, proxyHost);
-				// Register cleanup only after proxy is started
-				// exit handler must be synchronous — use server.close() directly
-				process.once("exit", () => {
-					proxyServer?.close();
-				});
-				process.once("SIGTERM", () => {
-					const server = proxyServer;
-					proxyServer = null; // Prevent exit handler from double-closing
-					if (server) {
-						stopCredentialProxy(server).finally(() => process.exit(0));
-					} else {
-						process.exit(0);
-					}
-				});
-				ctx.ui.notify(`Code review agent starting for ${repo} (container mode)`, "info");
+
+				if (useProxy) {
+					const proxyHost = detectProxyBindHost();
+					proxyServer = await startCredentialProxy(CREDENTIAL_PROXY_PORT, proxyHost);
+					// Register cleanup only after proxy is started
+					// exit handler must be synchronous — use server.close() directly
+					process.once("exit", () => {
+						proxyServer?.close();
+					});
+					process.once("SIGTERM", () => {
+						const server = proxyServer;
+						proxyServer = null; // Prevent exit handler from double-closing
+						if (server) {
+							stopCredentialProxy(server).finally(() => process.exit(0));
+						} else {
+							process.exit(0);
+						}
+					});
+				}
+
+				const modeLabel = useProxy ? "container+proxy" : `container+direct (${config.provider})`;
+				ctx.ui.notify(`Code review agent starting for ${repo} (${modeLabel})`, "info");
 			} catch (err: any) {
 				ctx.ui.notify(`Container setup failed: ${err.message}`, "error");
 				return;
@@ -785,6 +830,21 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 		});
 	}
 
+	/** Create a container-isolated sub-agent for a given skill. */
+	function createSubAgent(skillName: string): SubAgentClient {
+		const config = getProviderConfig();
+		const skillPath = join(skillsDir, skillName);
+		return new SubAgentClient(piCliPath, {
+			args: buildSubAgentArgs(skillName, config),
+			containerMode: {
+				repoDir,
+				stateDir: getStateDir(),
+				skillDirs: [skillPath],
+				providerConfig: config,
+			},
+		});
+	}
+
 	/** Save a session reference for debugging. Best-effort — failures are silently ignored. */
 	async function saveSessionRecord(client: SubAgentClient, type: "review" | "verify", file: string): Promise<void> {
 		try {
@@ -819,16 +879,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			// Ignore
 		}
 
-		const reviewSkillPath = join(skillsDir, "review");
-
-		const client = new SubAgentClient(piCliPath, {
-			args: ["--skill", CONTAINER_PATHS.skill("review"), "--no-extensions"],
-			containerMode: {
-				repoDir,
-				stateDir: getStateDir(),
-				skillDirs: [reviewSkillPath],
-			},
-		});
+		const client = createSubAgent("review");
 
 		const unsubscribe = setupToolMonitor(client, ctx, "Review");
 
@@ -894,16 +945,7 @@ Review the file thoroughly and write your findings as a JSON array to the output
 			// Ignore
 		}
 
-		const verifySkillPath = join(skillsDir, "verify");
-
-		const client = new SubAgentClient(piCliPath, {
-			args: ["--skill", CONTAINER_PATHS.skill("verify"), "--no-extensions"],
-			containerMode: {
-				repoDir,
-				stateDir: getStateDir(),
-				skillDirs: [verifySkillPath],
-			},
-		});
+		const client = createSubAgent("verify");
 
 		const unsubscribe = setupToolMonitor(client, ctx, "Verify");
 
