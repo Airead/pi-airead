@@ -374,9 +374,8 @@ export function buildIssueTitle(findings: Finding | Finding[]): string {
 }
 
 /** Format a single finding as a markdown section. */
-function formatFindingBody(finding: Finding, index?: number, verified?: boolean): string {
-	const verifiedLabel = verified === true ? " ✅ verified" : verified === false ? " (related, unverified)" : "";
-	const header = index != null ? `## Finding ${index + 1}${verifiedLabel}` : "## Issue";
+function formatFindingBody(finding: Finding, index?: number): string {
+	const header = index != null ? `## Finding ${index + 1}` : "## Issue";
 	return `${header}
 
 **File:** \`${finding.file}\`
@@ -442,7 +441,7 @@ export function createGitHubIssue(repo: string, findings: Finding | Finding[]): 
 	const title = buildIssueTitle(arr);
 	const sections = arr.length === 1
 		? formatFindingBody(arr[0])
-		: arr.map((f, i) => formatFindingBody(f, i, i === 0)).join("\n\n---\n\n");
+		: arr.map((f, i) => formatFindingBody(f, i)).join("\n\n---\n\n");
 	const body = `${sections}
 
 ---

@@ -1184,15 +1184,13 @@ Review the file thoroughly and write your findings as a JSON array to the output
 	// Round 2: Verify
 	// ========================================================================
 
-	async function runVerifyRound(repo: string, ctx: any): Promise<void> {
-		const cache = readJson<Finding[]>(statePath("findings-cache.json"), []);
-		if (cache.length === 0) return;
+	/**
+	 * Verify a single finding via sub-agent.
+	 * Returns the verified finding if confirmed, or null if rejected.
+	 */
+	async function verifySingleFinding(repo: string, finding: Finding, label: string): Promise<Finding | null> {
+		emit(`[${label}] Checking: ${finding.title}\n  file: ${finding.file}:${finding.line}-${finding.endLine}\n  severity: ${finding.severity}  category: ${finding.category}`);
 
-		// Take the top finding
-		const finding = cache[0];
-		emit(`────────────────────────────────────────\n[Verify] Checking: ${finding.title}\n  file: ${finding.file}:${finding.line}-${finding.endLine}\n  severity: ${finding.severity}  category: ${finding.category}`);
-
-		// Clean previous output
 		const verifyPath = statePath("verify-result.json");
 		assertStateWrite(verifyPath);
 		try {
@@ -1204,7 +1202,7 @@ Review the file thoroughly and write your findings as a JSON array to the output
 		const client = createSubAgent("verify");
 		activeClient = client;
 
-		const monitor = setupSubAgentMonitor(client, "Verify");
+		const monitor = setupSubAgentMonitor(client, label);
 
 		try {
 			await client.start();
@@ -1231,54 +1229,78 @@ IMPORTANT: Do NOT run any gh commands. Only verify the finding against actual co
 			await client.stop();
 		}
 
-		emit(formatStatsSummary(monitor.getStats(), "Verify"));
+		emit(formatStatsSummary(monitor.getStats(), label));
 
-		// Process result — gh operations happen on the host side
 		const result = readJson<VerifyResult>(statePath("verify-result.json"), { status: "rejected", reason: "No output", finding });
 
 		if (result.status === "submitted") {
 			const verifiedFinding = result.finding ?? finding;
 			const details = formatFindingDetails(verifiedFinding).map((l) => `  ${l}`).join("\n");
-			emit(`[Verify] CONFIRMED:\n${details}`);
-
-			// Find related findings in cache (same file + category) to bundle into one issue
-			const related = findRelatedFindings(cache, finding);
-			const allFindings = [verifiedFinding, ...related];
-			if (related.length > 0) {
-				const relatedSummary = related
-					.map((f) => `  [${f.severity}/${f.category}] ${f.title} (${f.file}:${f.line})`)
-					.join("\n");
-				emit(`[Verify] Bundling ${related.length} related finding(s):\n${relatedSummary}`);
-			}
-
-			// Host-side: check for duplicates and create issue
-			const isDuplicate = checkDuplicateIssue(repo, verifiedFinding);
-			if (!isDuplicate) {
-				const issueUrl = createGitHubIssue(repo, allFindings);
-				if (issueUrl) {
-					emit(`[Verify] Issue created (${allFindings.length} finding(s)): ${issueUrl}`);
-				} else {
-					emitWarn("[Verify] Finding verified but issue creation failed");
-				}
-			} else {
-				emit("[Verify] Duplicate found, skipping issue creation");
-			}
-
-			// Remove verified finding + all bundled related findings from cache
-			const cp = statePath("findings-cache.json");
-			assertStateWrite(cp);
-			const removedKeys = new Set([findingKey(finding), ...related.map(findingKey)]);
-			const remainingCache = cache.filter((f) => !removedKeys.has(findingKey(f)));
-			atomicWriteJson(cp, remainingCache);
-		} else {
-			emit(`[Verify] REJECTED: ${result.reason ?? "unknown reason"}\n  was: [${finding.severity}/${finding.category}] ${finding.title} (${finding.file}:${finding.line})`);
-
-			// Remove only the rejected finding from cache
-			const cp = statePath("findings-cache.json");
-			assertStateWrite(cp);
-			cache.shift();
-			atomicWriteJson(cp, cache);
+			emit(`[${label}] CONFIRMED:\n${details}`);
+			return verifiedFinding;
 		}
+
+		emit(`[${label}] REJECTED: ${result.reason ?? "unknown reason"}\n  was: [${finding.severity}/${finding.category}] ${finding.title} (${finding.file}:${finding.line})`);
+		return null;
+	}
+
+	async function runVerifyRound(repo: string, ctx: any): Promise<void> {
+		const cache = readJson<Finding[]>(statePath("findings-cache.json"), []);
+		if (cache.length === 0) return;
+
+		const finding = cache[0];
+		emit("────────────────────────────────────────");
+
+		// Verify primary finding
+		const verified = await verifySingleFinding(repo, finding, "Verify");
+		if (stopRequested) return; // Bail if stop was requested during verify
+
+		// Collect all findings to remove from cache (verified or not, the primary is always removed)
+		const removedKeys = new Set([findingKey(finding)]);
+
+		if (verified) {
+			const allVerified: Finding[] = [verified];
+
+			// Find and verify related findings (same file + category)
+			const related = findRelatedFindings(cache, finding);
+			if (related.length > 0) {
+				emit(`[Verify] Found ${related.length} related finding(s), verifying each...`);
+			}
+			for (const relatedFinding of related) {
+				if (stopRequested) break;
+				try {
+					const relatedVerified = await verifySingleFinding(repo, relatedFinding, "Verify+");
+					removedKeys.add(findingKey(relatedFinding));
+					if (relatedVerified) {
+						allVerified.push(relatedVerified);
+					}
+				} catch (err: any) {
+					emitWarn(`[Verify+] Failed to verify related finding: ${err.message}`);
+					removedKeys.add(findingKey(relatedFinding));
+				}
+			}
+
+			// Create issue with all verified findings (skip if stop was requested)
+			if (allVerified.length > 0 && !stopRequested) {
+				const isDuplicate = checkDuplicateIssue(repo, allVerified[0]);
+				if (!isDuplicate) {
+					const issueUrl = createGitHubIssue(repo, allVerified);
+					if (issueUrl) {
+						emit(`[Verify] Issue created (${allVerified.length} verified finding(s)): ${issueUrl}`);
+					} else {
+						emitWarn("[Verify] Findings verified but issue creation failed");
+					}
+				} else {
+					emit("[Verify] Duplicate found, skipping issue creation");
+				}
+			}
+		}
+
+		// Remove all processed findings from cache
+		const cp = statePath("findings-cache.json");
+		assertStateWrite(cp);
+		const remainingCache = cache.filter((f) => !removedKeys.has(findingKey(f)));
+		atomicWriteJson(cp, remainingCache);
 	}
 
 	// ========================================================================
