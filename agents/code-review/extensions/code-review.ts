@@ -764,6 +764,48 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 	}
 
 	// ========================================================================
+	// Sub-agent Helpers
+	// ========================================================================
+
+	/** Attach tool call monitoring to a sub-agent, returning the unsubscribe function. */
+	function setupToolMonitor(client: SubAgentClient, ctx: any, prefix: string): () => void {
+		let toolCallCount = 0;
+		return client.onEvent((event: any) => {
+			if (event.type === "tool_execution_start") {
+				toolCallCount++;
+				ctx.ui.notify(`[${prefix}] Tool (${toolCallCount}/${LIMITS.maxToolCallsPerSubAgent}): ${event.toolName}`, "info");
+				if (toolCallCount >= LIMITS.maxToolCallsPerSubAgent) {
+					ctx.ui.notify(`[${prefix}] Tool call limit reached, aborting sub-agent`, "warning");
+					client.abort().catch(() => {});
+				}
+			}
+			if (event.type === "tool_execution_end" && event.isError) {
+				ctx.ui.notify(`[${prefix}] Tool error: ${event.toolName}`, "warning");
+			}
+		});
+	}
+
+	/** Save a session reference for debugging. Best-effort — failures are silently ignored. */
+	async function saveSessionRecord(client: SubAgentClient, type: "review" | "verify", file: string): Promise<void> {
+		try {
+			const state = await client.getState();
+			const sp = statePath("sessions.json");
+			assertStateWrite(sp);
+			const sessions = readJson<SessionRecord[]>(sp, []);
+			sessions.push({
+				timestamp: new Date().toISOString(),
+				type,
+				file,
+				sessionFile: state.sessionFile,
+			});
+			if (sessions.length > 100) sessions.splice(0, sessions.length - 100);
+			atomicWriteJson(sp, sessions);
+		} catch {
+			// Session save is best-effort
+		}
+	}
+
+	// ========================================================================
 	// Round 1: Review
 	// ========================================================================
 
@@ -788,20 +830,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			},
 		});
 
-		let toolCallCount = 0;
-		const unsubscribe = client.onEvent((event: any) => {
-			if (event.type === "tool_execution_start") {
-				toolCallCount++;
-				ctx.ui.notify(`[Review] Tool (${toolCallCount}/${LIMITS.maxToolCallsPerSubAgent}): ${event.toolName}`, "info");
-				if (toolCallCount >= LIMITS.maxToolCallsPerSubAgent) {
-					ctx.ui.notify("[Review] Tool call limit reached, aborting sub-agent", "warning");
-					client.abort().catch(() => {});
-				}
-			}
-			if (event.type === "tool_execution_end" && event.isError) {
-				ctx.ui.notify(`[Review] Tool error: ${event.toolName}`, "warning");
-			}
-		});
+		const unsubscribe = setupToolMonitor(client, ctx, "Review");
 
 		try {
 			await client.start();
@@ -817,24 +846,7 @@ Review the file thoroughly and write your findings as a JSON array to the output
 				LIMITS.reviewTimeoutMs,
 			);
 
-			// Save session reference
-			try {
-				const state = await client.getState();
-				const sp = statePath("sessions.json");
-				assertStateWrite(sp);
-				const sessions = readJson<SessionRecord[]>(sp, []);
-				sessions.push({
-					timestamp: new Date().toISOString(),
-					type: "review",
-					file,
-					sessionFile: state.sessionFile,
-				});
-				// Keep last 100 session records
-				if (sessions.length > 100) sessions.splice(0, sessions.length - 100);
-				atomicWriteJson(sp, sessions);
-			} catch {
-				// Session save is best-effort
-			}
+			await saveSessionRecord(client, "review", file);
 		} finally {
 			unsubscribe();
 			await client.stop();
@@ -893,20 +905,7 @@ Review the file thoroughly and write your findings as a JSON array to the output
 			},
 		});
 
-		let toolCallCount = 0;
-		const unsubscribe = client.onEvent((event: any) => {
-			if (event.type === "tool_execution_start") {
-				toolCallCount++;
-				ctx.ui.notify(`[Verify] Tool (${toolCallCount}/${LIMITS.maxToolCallsPerSubAgent}): ${event.toolName}`, "info");
-				if (toolCallCount >= LIMITS.maxToolCallsPerSubAgent) {
-					ctx.ui.notify("[Verify] Tool call limit reached, aborting sub-agent", "warning");
-					client.abort().catch(() => {});
-				}
-			}
-			if (event.type === "tool_execution_end" && event.isError) {
-				ctx.ui.notify(`[Verify] Tool error: ${event.toolName}`, "warning");
-			}
-		});
+		const unsubscribe = setupToolMonitor(client, ctx, "Verify");
 
 		try {
 			await client.start();
@@ -926,23 +925,7 @@ IMPORTANT: Do NOT run any gh commands. Only verify the finding against actual co
 				LIMITS.verifyTimeoutMs,
 			);
 
-			// Save session reference
-			try {
-				const state = await client.getState();
-				const sp = statePath("sessions.json");
-				assertStateWrite(sp);
-				const sessions = readJson<SessionRecord[]>(sp, []);
-				sessions.push({
-					timestamp: new Date().toISOString(),
-					type: "verify",
-					file: finding.file,
-					sessionFile: state.sessionFile,
-				});
-				if (sessions.length > 100) sessions.splice(0, sessions.length - 100);
-				atomicWriteJson(sp, sessions);
-			} catch {
-				// Session save is best-effort
-			}
+			await saveSessionRecord(client, "verify", finding.file);
 		} finally {
 			unsubscribe();
 			await client.stop();
