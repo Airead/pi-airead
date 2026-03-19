@@ -47,23 +47,16 @@ If the answer to any of these is "no", **reject the finding**.
 
 ### Output
 
-Write the verification result to the file specified in the prompt as JSON:
+Write the verification result to the file specified in the prompt as **compact JSON** (no extra whitespace or newlines — minimize output tokens):
 
 ```json
-{
-  "status": "submitted",
-  "finding": { ... }
-}
+{"status":"submitted","finding":{...}}
 ```
 
 Or if rejected:
 
 ```json
-{
-  "status": "rejected",
-  "reason": "The input is already sanitized by the middleware in src/middleware/sanitize.ts:15",
-  "finding": { ... }
-}
+{"status":"rejected","reason":"The input is already sanitized by the middleware in src/middleware/sanitize.ts:15","finding":{...}}
 ```
 
 ### Important Rules

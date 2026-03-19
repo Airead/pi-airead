@@ -876,18 +876,32 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 		}
 	}
 
+	/** Unwrap pi's tool result envelope: {content:[{type:"text",text:"..."}]} → text string. */
+	function unwrapResult(result: any): string | null {
+		if (result == null) return null;
+		if (typeof result === "string") return result;
+		// Pi wraps tool results as {content:[{type:"text",text:"..."}]}
+		if (result.content && Array.isArray(result.content)) {
+			const texts = result.content
+				.filter((c: any) => c.type === "text" && typeof c.text === "string")
+				.map((c: any) => c.text);
+			if (texts.length > 0) return texts.join("\n");
+		}
+		return JSON.stringify(result);
+	}
+
 	/** Extract a human-readable summary of a tool result. */
 	function formatToolResult(toolName: string, result: any, isError: boolean): string {
-		if (isError) return `ERROR: ${truncate(String(result ?? ""), 150)}`;
-		if (result == null) return "(empty)";
+		const text = unwrapResult(result);
+		if (isError) return `ERROR: ${truncate(text ?? "", 150)}`;
+		if (!text) return "(empty)";
 		// For read results, show line count instead of dumping content
-		if (toolName === "read" && typeof result === "string") {
-			const lines = result.split("\n");
+		if (toolName === "read") {
+			const lines = text.split("\n");
 			const preview = lines.slice(0, 2).join(" ").trim();
 			return `${lines.length} lines` + (preview ? ` — ${truncate(preview, 100)}` : "");
 		}
-		const str = typeof result === "string" ? result : JSON.stringify(result);
-		return truncate(str, 200);
+		return truncate(text, 200);
 	}
 
 	/** Format a finding's key details as display lines. */
@@ -1109,7 +1123,7 @@ Use the "verify" skill to guide your verification process. Read the skill file t
 **GitHub repo:** ${repo}
 **Finding to verify:**
 \`\`\`json
-${JSON.stringify(finding, null, 2)}
+${JSON.stringify(finding)}
 \`\`\`
 **Result output path:** ${CONTAINER_PATHS.stateFile("verify-result.json")}
 

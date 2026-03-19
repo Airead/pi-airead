@@ -44,22 +44,10 @@ Focus on these categories (in priority order):
 
 ### Step 4: Output Findings
 
-Write findings to the output path specified in the prompt (typically `/workspace/state/pending-findings.json`) as JSON:
+Write findings to the output path specified in the prompt (typically `/workspace/state/pending-findings.json`) as **compact JSON** (no extra whitespace or newlines — minimize output tokens):
 
 ```json
-[
-  {
-    "file": "src/utils/parser.ts",
-    "line": 42,
-    "endLine": 50,
-    "severity": "high",
-    "category": "security",
-    "title": "Unsanitized user input passed to SQL query",
-    "description": "The `query` parameter from user input is interpolated directly into the SQL string without parameterization. This allows SQL injection attacks.",
-    "codeSnippet": "db.query(`SELECT * FROM users WHERE name = '${query}'`)",
-    "suggestion": "Use parameterized queries: db.query('SELECT * FROM users WHERE name = $1', [query])"
-  }
-]
+[{"file":"src/utils/parser.ts","line":42,"endLine":50,"severity":"high","category":"security","title":"Unsanitized user input passed to SQL query","description":"The query parameter is interpolated directly into SQL without parameterization, allowing SQL injection.","codeSnippet":"db.query(`SELECT * FROM users WHERE name = '${query}'`)","suggestion":"Use parameterized queries: db.query('SELECT * FROM users WHERE name = $1', [query])"}]
 ```
 
 **Field requirements:**
