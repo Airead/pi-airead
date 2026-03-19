@@ -7,7 +7,7 @@ FROM node:22-slim
 RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 
 # Install pi CLI globally
-RUN npm install -g @anthropic-ai/pi-coding-agent
+RUN npm install -g @mariozechner/pi-coding-agent
 
 # Create workspace directories
 RUN mkdir -p /workspace/repo /workspace/state /workspace/skills

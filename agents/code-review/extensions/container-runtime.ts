@@ -245,7 +245,7 @@ export function buildContainerArgs(options: {
  */
 export function piCliPathInContainer(): string {
 	// npm global installs to /usr/local/lib/node_modules/ for node:22-slim
-	return "/usr/local/lib/node_modules/@anthropic-ai/pi-coding-agent/dist/cli.js";
+	return "/usr/local/lib/node_modules/@mariozechner/pi-coding-agent/dist/cli.js";
 }
 
 /**
