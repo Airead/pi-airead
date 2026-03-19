@@ -70,6 +70,8 @@ export const CONTAINER_PATHS = {
 	skillsRoot: "/workspace/skills",
 	skill: (name: string) => `/workspace/skills/${name}`,
 	stateFile: (name: string) => `/workspace/state/${name}`,
+	/** Pi config dir inside container (node user home). Sessions are persisted here. */
+	piHome: "/home/node/.pi",
 } as const;
 
 /**
@@ -185,11 +187,12 @@ export function buildContainerArgs(options: {
 	containerName: string;
 	repoDir: string;
 	stateDir: string;
+	sessionsDir?: string;
 	skillDirs: string[];
 	piCommand: string[];
 	providerConfig?: ProviderConfig;
 }): string[] {
-	const { containerName, repoDir, stateDir, skillDirs, piCommand, providerConfig } = options;
+	const { containerName, repoDir, stateDir, sessionsDir, skillDirs, piCommand, providerConfig } = options;
 	const gateway = CONTAINER_HOST_GATEWAY;
 	const isAnthropicProxy = !providerConfig || providerConfig.provider === "anthropic";
 
@@ -209,6 +212,8 @@ export function buildContainerArgs(options: {
 		...writableMountArgs(stateDir, CONTAINER_PATHS.state),
 		// Read-only skills
 		...skillDirs.flatMap((s) => readonlyMountArgs(s, CONTAINER_PATHS.skill(basename(s)))),
+		// Writable pi home (persists sessions to host)
+		...(sessionsDir ? writableMountArgs(sessionsDir, CONTAINER_PATHS.piHome) : []),
 	];
 
 	if (isAnthropicProxy) {

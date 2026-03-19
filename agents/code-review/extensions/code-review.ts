@@ -69,6 +69,7 @@ export const LIMITS = {
 export interface ContainerModeOptions {
 	repoDir: string;
 	stateDir: string;
+	sessionsDir?: string;
 	skillDirs: string[];
 	providerConfig?: ProviderConfig;
 }
@@ -101,13 +102,14 @@ class SubAgentClient {
 		const args = ["--mode", "rpc", ...(this.options.args ?? [])];
 
 		if (this.options.containerMode) {
-			const { repoDir, stateDir, skillDirs, providerConfig } = this.options.containerMode;
+			const { repoDir, stateDir, sessionsDir, skillDirs, providerConfig } = this.options.containerMode;
 			this.containerName = `code-review-${Date.now()}`;
 
 			const dockerArgs = buildContainerArgs({
 				containerName: this.containerName,
 				repoDir,
 				stateDir,
+				sessionsDir,
 				skillDirs,
 				piCommand: ["node", piCliPathInContainer(), ...args],
 				providerConfig,
@@ -821,22 +823,131 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 	// Sub-agent Helpers
 	// ========================================================================
 
-	/** Attach tool call monitoring to a sub-agent, returning the unsubscribe function. */
-	function setupToolMonitor(client: SubAgentClient, ctx: any, prefix: string): () => void {
-		let toolCallCount = 0;
-		return client.onEvent((event: any) => {
+	/** Accumulated token usage and cost for a sub-agent run. */
+	interface SubAgentStats {
+		toolCalls: number;
+		input: number;
+		output: number;
+		cacheRead: number;
+		cacheWrite: number;
+		cost: number;
+	}
+
+	/** Truncate a string to maxLen, appending "…" if truncated. */
+	function truncate(s: string, maxLen: number): string {
+		if (s.length <= maxLen) return s;
+		return s.slice(0, maxLen) + "…";
+	}
+
+	/** Extract a human-readable summary of tool arguments. */
+	function formatToolArgs(toolName: string, args: any): string {
+		if (!args || typeof args !== "object") return "";
+		switch (toolName) {
+			case "read":
+				return args.file_path ?? args.path ?? "";
+			case "grep": {
+				const pattern = args.pattern ? `"${args.pattern}"` : "";
+				const path = args.path ?? "";
+				return `${pattern} ${path}`.trim();
+			}
+			case "write":
+				return args.file_path ?? args.path ?? "";
+			case "bash":
+				return truncate(String(args.command ?? ""), 120);
+			case "glob":
+				return args.pattern ?? "";
+			default:
+				return truncate(JSON.stringify(args), 120);
+		}
+	}
+
+	/** Extract a human-readable summary of a tool result. */
+	function formatToolResult(toolName: string, result: any, isError: boolean): string {
+		if (isError) return `ERROR: ${truncate(String(result ?? ""), 150)}`;
+		if (result == null) return "(empty)";
+		const str = typeof result === "string" ? result : JSON.stringify(result);
+		// For read results, show line count instead of dumping content
+		if (toolName === "read" && typeof result === "string") {
+			const lines = result.split("\n").length;
+			const preview = result.split("\n").slice(0, 2).join(" ").trim();
+			return `${lines} lines` + (preview ? ` — ${truncate(preview, 100)}` : "");
+		}
+		return truncate(str, 200);
+	}
+
+	/** Format token/cost stats as a readable string. */
+	function formatStats(stats: SubAgentStats): string {
+		const parts = [`${stats.toolCalls} tool calls`];
+		const totalTokens = stats.input + stats.output + stats.cacheRead + stats.cacheWrite;
+		if (totalTokens > 0) {
+			parts.push(`tokens: ${stats.input} in + ${stats.output} out + ${stats.cacheRead} cache-read + ${stats.cacheWrite} cache-write`);
+		}
+		if (stats.cost > 0) {
+			parts.push(`cost: $${stats.cost.toFixed(4)}`);
+		}
+		return parts.join(" | ");
+	}
+
+	/**
+	 * Attach comprehensive monitoring to a sub-agent.
+	 * Streams tool calls, arguments, results, and token usage to the host UI.
+	 */
+	function setupSubAgentMonitor(
+		client: SubAgentClient,
+		ctx: any,
+		prefix: string,
+	): { unsubscribe: () => void; getStats: () => SubAgentStats } {
+		const stats: SubAgentStats = { toolCalls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+
+		const unsubscribe = client.onEvent((event: any) => {
 			if (event.type === "tool_execution_start") {
-				toolCallCount++;
-				ctx.ui.notify(`[${prefix}] Tool (${toolCallCount}/${LIMITS.maxToolCallsPerSubAgent}): ${event.toolName}`, "info");
-				if (toolCallCount >= LIMITS.maxToolCallsPerSubAgent) {
+				stats.toolCalls++;
+				const argSummary = formatToolArgs(event.toolName, event.args);
+				ctx.ui.notify(
+					`[${prefix}] → ${event.toolName} (${stats.toolCalls}/${LIMITS.maxToolCallsPerSubAgent})${argSummary ? ": " + argSummary : ""}`,
+					"info",
+				);
+				if (stats.toolCalls >= LIMITS.maxToolCallsPerSubAgent) {
 					ctx.ui.notify(`[${prefix}] Tool call limit reached, aborting sub-agent`, "warning");
 					client.abort().catch(() => {});
 				}
 			}
-			if (event.type === "tool_execution_end" && event.isError) {
-				ctx.ui.notify(`[${prefix}] Tool error: ${event.toolName}`, "warning");
+
+			if (event.type === "tool_execution_end") {
+				const resultSummary = formatToolResult(event.toolName, event.result, event.isError);
+				ctx.ui.notify(`[${prefix}] ← ${event.toolName}: ${resultSummary}`, "info");
+			}
+
+			// Accumulate token usage from assistant messages and show per-turn delta
+			if (event.type === "message_end" && event.message?.role === "assistant" && event.message?.usage) {
+				const u = event.message.usage;
+				const turnIn = u.input ?? 0;
+				const turnOut = u.output ?? 0;
+				const turnCacheRead = u.cacheRead ?? 0;
+				const turnCost = u.cost?.total ?? 0;
+				stats.input += turnIn;
+				stats.output += turnOut;
+				stats.cacheRead += turnCacheRead;
+				stats.cacheWrite += u.cacheWrite ?? 0;
+				stats.cost += turnCost;
+				// Show per-turn token consumption
+				const turnCacheWrite = u.cacheWrite ?? 0;
+				let turnLabel = `${turnIn} in + ${turnOut} out + ${turnCacheRead} cache-read + ${turnCacheWrite} cache-write`;
+				if (turnCost > 0) turnLabel += ` ($${turnCost.toFixed(4)})`;
+				ctx.ui.notify(`[${prefix}] :: turn tokens: ${turnLabel}`, "info");
 			}
 		});
+
+		return { unsubscribe, getStats: () => stats };
+	}
+
+	/** Resolve sessions directory for persisting sub-agent pi sessions to host. */
+	function getSessionsDir(): string {
+		const dataDir = pi.getFlag("review-data-dir") as string | undefined;
+		if (!dataDir) throw new Error("Missing required --review-data-dir flag");
+		const dir = join(dataDir, "sessions");
+		ensureDir(dir);
+		return dir;
 	}
 
 	/** Create a container-isolated sub-agent for a given skill. */
@@ -848,6 +959,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			containerMode: {
 				repoDir,
 				stateDir: getStateDir(),
+				sessionsDir: getSessionsDir(),
 				skillDirs: [skillPath],
 				providerConfig: config,
 			},
@@ -890,7 +1002,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 
 		const client = createSubAgent("review");
 
-		const unsubscribe = setupToolMonitor(client, ctx, "Review");
+		const monitor = setupSubAgentMonitor(client, ctx, "Review");
 
 		try {
 			await client.start();
@@ -908,9 +1020,11 @@ Review the file thoroughly and write your findings as a JSON array to the output
 
 			await saveSessionRecord(client, "review", file);
 		} finally {
-			unsubscribe();
+			monitor.unsubscribe();
 			await client.stop();
 		}
+
+		ctx.ui.notify(`[Review] Done — ${formatStats(monitor.getStats())}`, "info");
 
 		// Merge new findings into cache (validate sub-agent output)
 		const rawFindings = readJson<unknown[]>(statePath("pending-findings.json"), []);
@@ -956,7 +1070,7 @@ Review the file thoroughly and write your findings as a JSON array to the output
 
 		const client = createSubAgent("verify");
 
-		const unsubscribe = setupToolMonitor(client, ctx, "Verify");
+		const monitor = setupSubAgentMonitor(client, ctx, "Verify");
 
 		try {
 			await client.start();
@@ -978,9 +1092,11 @@ IMPORTANT: Do NOT run any gh commands. Only verify the finding against actual co
 
 			await saveSessionRecord(client, "verify", finding.file);
 		} finally {
-			unsubscribe();
+			monitor.unsubscribe();
 			await client.stop();
 		}
+
+		ctx.ui.notify(`[Verify] Done — ${formatStats(monitor.getStats())}`, "info");
 
 		// Process result — gh operations happen on the host side
 		const result = readJson<VerifyResult>(statePath("verify-result.json"), { status: "rejected", reason: "No output", finding });
