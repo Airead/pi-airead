@@ -541,7 +541,13 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				loopTimer = null;
 			}
 			loopActive = false;
-			ctx.ui.notify("Review loop stopped", "info");
+			stopRequested = true;
+			if (activeClient) {
+				activeClient.abort().catch(() => {});
+				ctx.ui.notify("Review loop stopped (aborting running sub-agent)", "info");
+			} else {
+				ctx.ui.notify("Review loop stopped", "info");
+			}
 		},
 	});
 
@@ -638,6 +644,10 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 	let loopTimer: ReturnType<typeof setTimeout> | null = null;
 	let isRunning = false;
 	let consecutiveFailures = 0;
+	/** Currently running sub-agent client, if any. Set by round functions for stop/abort. */
+	let activeClient: SubAgentClient | null = null;
+	/** Set by review-stop to interrupt the current cycle between rounds. */
+	let stopRequested = false;
 
 	function checkSafetyGatesLocal(): string | null {
 		const today = new Date().toISOString().slice(0, 10);
@@ -656,6 +666,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 
 	function startReviewLoop(repo: string, ctx: any): void {
 		if (loopActive) return;
+		stopRequested = false;
 		loopActive = true;
 		consecutiveFailures = 0;
 
@@ -726,6 +737,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			throw new Error(`Invalid repo format: ${repo}. Expected: owner/repo`);
 		}
 		isRunning = true;
+		stopRequested = false;
 
 		try {
 			ctx.ui.setStatus("code-review", undefined); // Clear previous status
@@ -762,6 +774,13 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			// Step 2: Review round
 			updateCycleState({ status: "reviewing", file, repo, startedAt: new Date().toISOString() });
 			await runReviewRound(repo, file, ctx);
+
+			// Check if stop was requested between rounds
+			if (stopRequested) {
+				emit("[Cycle] Stop requested, skipping verify round");
+				updateCycleState({ status: "idle" });
+				return true;
+			}
 
 			// Step 3: Verify round (if there are findings in cache)
 			const cache = readJson<Finding[]>(statePath("findings-cache.json"), []);
@@ -1104,6 +1123,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 		}
 
 		const client = createSubAgent("review");
+		activeClient = client;
 
 		const monitor = setupSubAgentMonitor(client, "Review");
 
@@ -1123,6 +1143,7 @@ Review the file thoroughly and write your findings as a JSON array to the output
 
 			await saveSessionRecord(client, "review", file);
 		} finally {
+			activeClient = null;
 			monitor.unsubscribe();
 			await client.stop();
 		}
@@ -1175,6 +1196,7 @@ Review the file thoroughly and write your findings as a JSON array to the output
 		}
 
 		const client = createSubAgent("verify");
+		activeClient = client;
 
 		const monitor = setupSubAgentMonitor(client, "Verify");
 
@@ -1198,6 +1220,7 @@ IMPORTANT: Do NOT run any gh commands. Only verify the finding against actual co
 
 			await saveSessionRecord(client, "verify", finding.file);
 		} finally {
+			activeClient = null;
 			monitor.unsubscribe();
 			await client.stop();
 		}
