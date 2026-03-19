@@ -428,6 +428,10 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 		description: "Model ID for sub-agents",
 		type: "string",
 	});
+	pi.registerFlag("review-auto-start", {
+		description: "Automatically start review loop on session start",
+		type: "boolean",
+	});
 
 	/** Cached provider config, resolved once at session start. */
 	let _providerConfig: ProviderConfig | null = null;
@@ -586,12 +590,17 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				}
 
 				const modeLabel = useProxy ? "container+proxy" : `container+direct (${config.provider})`;
-				ctx.ui.notify(`Code review agent starting for ${repo} (${modeLabel})`, "info");
+				ctx.ui.notify(`Code review agent ready for ${repo} (${modeLabel})`, "info");
 			} catch (err: any) {
 				ctx.ui.notify(`Container setup failed: ${err.message}`, "error");
 				return;
 			}
-			startReviewLoop(repo, ctx);
+
+			if (pi.getFlag("review-auto-start")) {
+				startReviewLoop(repo, ctx);
+			} else {
+				ctx.ui.notify("Use /review-start to begin the review loop", "info");
+			}
 		}
 	});
 

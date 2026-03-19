@@ -45,6 +45,7 @@ DATA_DIR=""
 INTERVAL="1"
 PROVIDER=""
 MODEL=""
+AUTO_START=false
 
 usage() {
     cat <<EOF
@@ -58,6 +59,7 @@ Optional:
   --interval <hours>     Hours between review cycles (default: 1)
   --provider <name>      AI provider (default: anthropic). e.g., zai, openai, google
   --model <id>           Model ID. e.g., glm-5, gpt-5.4
+  --auto-start           Automatically start review loop (default: wait for /review-start)
   --help                 Show this help message
 EOF
     exit "${1:-0}"
@@ -87,6 +89,8 @@ while [ $# -gt 0 ]; do
         --model)
             require_arg "$@"
             MODEL="$2"; shift 2 ;;
+        --auto-start)
+            AUTO_START=true; shift ;;
         --help|-h)
             usage 0 ;;
         *)
@@ -253,6 +257,10 @@ PI_ARGS+=(--provider "$PROVIDER")
 if [ -n "$MODEL" ]; then
     PI_ARGS+=(--model "$MODEL")
     PI_ARGS+=(--review-model "$MODEL")
+fi
+
+if [ "$AUTO_START" = true ]; then
+    PI_ARGS+=(--review-auto-start)
 fi
 
 exec pi "${PI_ARGS[@]}"
