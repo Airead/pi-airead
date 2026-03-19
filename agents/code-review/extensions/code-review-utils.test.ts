@@ -1,7 +1,16 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+
+vi.mock("node:child_process", async () => {
+	const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+	return {
+		...actual,
+		execFileSync: vi.fn(actual.execFileSync),
+	};
+});
+import { execFileSync } from "node:child_process";
 import {
 	type DailyStats,
 	type Finding,
@@ -9,8 +18,11 @@ import {
 	type SessionRecord,
 	assertPathAllowed,
 	atomicWriteJson,
+	buildIssueTitle,
+	checkDuplicateIssue,
 	checkSafetyGates,
 	cleanupOldSessions,
+	createGitHubIssue,
 	ensureDir,
 	filterValidFindings,
 	incrementDailyStats,
@@ -690,5 +702,125 @@ describe("parseIntervalHours", () => {
 	it("returns default for Infinity and NaN strings", () => {
 		expect(parseIntervalHours("Infinity")).toBe(1);
 		expect(parseIntervalHours("NaN")).toBe(1);
+	});
+});
+
+// ============================================================================
+// buildIssueTitle
+// ============================================================================
+
+describe("buildIssueTitle", () => {
+	it("formats title with category, title, file, and line", () => {
+		const finding = makeFinding({ category: "security", title: "SQL injection", file: "app.ts", line: 42 });
+		expect(buildIssueTitle(finding)).toBe("[ai-review] security: SQL injection (app.ts:42)");
+	});
+
+	it("uses finding defaults correctly", () => {
+		expect(buildIssueTitle(makeFinding())).toBe("[ai-review] bug: Test finding (src/index.ts:1)");
+	});
+});
+
+// ============================================================================
+// checkDuplicateIssue
+// ============================================================================
+
+describe("checkDuplicateIssue", () => {
+	const mockExecFileSync = vi.mocked(execFileSync);
+
+	afterEach(() => {
+		mockExecFileSync.mockReset();
+	});
+
+	it("returns false for invalid repo format", () => {
+		expect(checkDuplicateIssue("invalid", makeFinding())).toBe(false);
+	});
+
+	it("returns true when a matching issue exists", () => {
+		const issues = [
+			{ title: "[ai-review] bug: Test finding (src/index.ts:1)", body: "src/index.ts:1" },
+		];
+		mockExecFileSync.mockReturnValue(JSON.stringify(issues) as any);
+		expect(checkDuplicateIssue("owner/repo", makeFinding())).toBe(true);
+	});
+
+	it("returns false when no matching issue exists", () => {
+		const issues = [
+			{ title: "[ai-review] bug: Other issue (other.ts:5)", body: "other.ts:5" },
+		];
+		mockExecFileSync.mockReturnValue(JSON.stringify(issues) as any);
+		expect(checkDuplicateIssue("owner/repo", makeFinding())).toBe(false);
+	});
+
+	it("returns false when gh command fails", () => {
+		mockExecFileSync.mockImplementation(() => {
+			throw new Error("gh not found");
+		});
+		expect(checkDuplicateIssue("owner/repo", makeFinding())).toBe(false);
+	});
+
+	it("returns false for empty issue list", () => {
+		mockExecFileSync.mockReturnValue("[]" as any);
+		expect(checkDuplicateIssue("owner/repo", makeFinding())).toBe(false);
+	});
+});
+
+// ============================================================================
+// createGitHubIssue
+// ============================================================================
+
+describe("createGitHubIssue", () => {
+	const mockExecFileSync = vi.mocked(execFileSync);
+
+	afterEach(() => {
+		mockExecFileSync.mockReset();
+	});
+
+	it("returns undefined for invalid repo format", () => {
+		expect(createGitHubIssue("invalid", makeFinding())).toBeUndefined();
+	});
+
+	it("returns issue URL on success", () => {
+		mockExecFileSync.mockImplementation((_cmd: unknown, args: unknown) => {
+			if ((args as string[])?.includes("label")) return "" as any;
+			return "https://github.com/owner/repo/issues/123\n" as any;
+		});
+		const url = createGitHubIssue("owner/repo", makeFinding());
+		expect(url).toBe("https://github.com/owner/repo/issues/123");
+	});
+
+	it("returns undefined when gh issue create fails", () => {
+		mockExecFileSync.mockImplementation((_cmd: unknown, args: unknown) => {
+			if ((args as string[])?.includes("label")) return "" as any;
+			throw new Error("gh failed");
+		});
+		expect(createGitHubIssue("owner/repo", makeFinding())).toBeUndefined();
+	});
+
+	it("still works when label already exists", () => {
+		let issueCreateCalled = false;
+		mockExecFileSync.mockImplementation((_cmd: unknown, args: unknown) => {
+			if ((args as string[])?.includes("label")) {
+				throw new Error("label already exists");
+			}
+			issueCreateCalled = true;
+			return "https://github.com/owner/repo/issues/456\n" as any;
+		});
+		const url = createGitHubIssue("owner/repo", makeFinding());
+		expect(url).toBe("https://github.com/owner/repo/issues/456");
+		expect(issueCreateCalled).toBe(true);
+	});
+
+	it("formats issue title correctly", () => {
+		let capturedArgs: string[] = [];
+		mockExecFileSync.mockImplementation((_cmd: unknown, args: unknown) => {
+			if ((args as string[])?.includes("label")) return "" as any;
+			capturedArgs = args as string[];
+			return "https://github.com/owner/repo/issues/1\n" as any;
+		});
+		const finding = makeFinding({ title: "SQL injection", category: "security", file: "app.ts", line: 42 });
+		createGitHubIssue("owner/repo", finding);
+		const titleIdx = capturedArgs.indexOf("--title");
+		expect(titleIdx).toBeGreaterThan(-1);
+		expect(capturedArgs[titleIdx + 1]).toBe("[ai-review] security: SQL injection (app.ts:42)");
 	});
 });

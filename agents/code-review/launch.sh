@@ -96,6 +96,21 @@ if ! gh auth status &>/dev/null; then
     exit 1
 fi
 
+if ! command -v docker &>/dev/null; then
+    echo "Error: 'docker' command not found. Docker is required for container isolation."
+    exit 1
+fi
+
+if ! docker info &>/dev/null 2>&1; then
+    echo "Error: Docker is not running. Please start Docker first."
+    exit 1
+fi
+
+if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+    echo "Error: ANTHROPIC_API_KEY environment variable is required for credential proxy."
+    exit 1
+fi
+
 # --------------------------------------------------------------------------
 # Prepare directories
 # --------------------------------------------------------------------------
@@ -108,6 +123,20 @@ MAX_REPO_SIZE_MB=500
 
 mkdir -p "$STATE_DIR"
 mkdir -p "$WORKSPACE_DIR"
+
+# --------------------------------------------------------------------------
+# Ensure Docker image is built
+# --------------------------------------------------------------------------
+
+IMAGE_NAME="code-review-agent"
+CONTAINER_DIR="$SCRIPT_DIR/container"
+
+if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
+    echo "Building Docker image: $IMAGE_NAME"
+    docker build -t "$IMAGE_NAME" "$CONTAINER_DIR"
+else
+    echo "Docker image '$IMAGE_NAME' already exists."
+fi
 
 # --------------------------------------------------------------------------
 # Clone or update repository

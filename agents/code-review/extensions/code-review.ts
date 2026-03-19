@@ -1,8 +1,10 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { Server } from "node:http";
 import {
 	type CycleState,
 	type DailyStats,
@@ -12,8 +14,10 @@ import {
 	type VerifyResult,
 	assertPathAllowed,
 	atomicWriteJson,
+	checkDuplicateIssue,
 	checkSafetyGates,
 	cleanupOldSessions,
+	createGitHubIssue,
 	ensureDir,
 	filterValidFindings,
 	incrementDailyStats,
@@ -25,6 +29,16 @@ import {
 	trimReviewedFiles,
 	validateRepo,
 } from "./code-review-utils.js";
+import {
+	buildContainerArgs,
+	cleanupOrphans,
+	CONTAINER_PATHS,
+	ensureImageBuilt,
+	piCliPathInContainer,
+	stopContainer,
+	detectProxyBindHost,
+} from "./container-runtime.js";
+import { CREDENTIAL_PROXY_PORT, startCredentialProxy, stopCredentialProxy } from "./credential-proxy.js";
 
 // ============================================================================
 // Resource Safety Limits
@@ -51,6 +65,12 @@ export const LIMITS = {
 // Lightweight RPC Client (avoids import issues with pi internals)
 // ============================================================================
 
+export interface ContainerModeOptions {
+	repoDir: string;
+	stateDir: string;
+	skillDirs: string[];
+}
+
 class SubAgentClient {
 	private process: ChildProcess | null = null;
 	private eventListeners: Array<(event: any) => void> = [];
@@ -59,9 +79,9 @@ class SubAgentClient {
 		string,
 		{ resolve: (res: any) => void; reject: (err: Error) => void; timer: ReturnType<typeof setTimeout> }
 	>();
-	private requestId = 0;
 	private stderr = "";
 	private buffer = "";
+	private containerName: string | null = null;
 
 	constructor(
 		private cliPath: string,
@@ -69,6 +89,7 @@ class SubAgentClient {
 			cwd?: string;
 			args?: string[];
 			env?: Record<string, string>;
+			containerMode?: ContainerModeOptions;
 		} = {},
 	) {}
 
@@ -77,18 +98,42 @@ class SubAgentClient {
 
 		const args = ["--mode", "rpc", ...(this.options.args ?? [])];
 
-		this.process = spawn("node", [this.cliPath, ...args], {
-			cwd: this.options.cwd,
-			env: { ...process.env, ...this.options.env },
-			stdio: ["pipe", "pipe", "pipe"],
-		});
+		if (this.options.containerMode) {
+			const { repoDir, stateDir, skillDirs } = this.options.containerMode;
+			this.containerName = `code-review-${Date.now()}`;
+
+			const dockerArgs = buildContainerArgs({
+				containerName: this.containerName,
+				repoDir,
+				stateDir,
+				skillDirs,
+				piCommand: ["node", piCliPathInContainer(), ...args],
+			});
+
+			this.process = spawn("docker", dockerArgs, {
+				stdio: ["pipe", "pipe", "pipe"],
+			});
+		} else {
+			this.process = spawn("node", [this.cliPath, ...args], {
+				cwd: this.options.cwd,
+				env: { ...process.env, ...this.options.env },
+				stdio: ["pipe", "pipe", "pipe"],
+			});
+		}
 
 		this.process.stderr?.on("data", (data: Buffer) => {
-			this.stderr += data.toString();
+			// Cap stderr to prevent unbounded memory growth
+			if (this.stderr.length < 100_000) {
+				this.stderr += data.toString();
+			}
 		});
 
 		this.process.stdout?.on("data", (data: Buffer) => {
 			this.buffer += data.toString();
+			// Cap buffer to prevent unbounded growth from partial lines
+			if (this.buffer.length > 1_000_000) {
+				this.buffer = this.buffer.slice(-500_000);
+			}
 			let newlineIndex: number;
 			while ((newlineIndex = this.buffer.indexOf("\n")) !== -1) {
 				const line = this.buffer.slice(0, newlineIndex);
@@ -122,22 +167,38 @@ class SubAgentClient {
 		if (this.process.exitCode !== null) {
 			this.process = null;
 			this.pendingRequests.clear();
+			this.containerName = null;
 			return;
 		}
 
-		this.process.kill("SIGTERM");
-		await new Promise<void>((resolve) => {
-			const timeout = setTimeout(() => {
-				this.process?.kill("SIGKILL");
-				resolve();
-			}, 3000);
-			this.process?.on("exit", () => {
-				clearTimeout(timeout);
-				resolve();
+		if (this.containerName) {
+			// Container mode: use docker stop instead of SIGTERM
+			stopContainer(this.containerName);
+			// Wait for the process to exit after docker stop
+			await new Promise<void>((resolve) => {
+				const timeout = setTimeout(() => resolve(), 5000);
+				this.process?.on("exit", () => {
+					clearTimeout(timeout);
+					resolve();
+				});
 			});
-		});
+		} else {
+			// Direct mode: SIGTERM with fallback to SIGKILL
+			this.process.kill("SIGTERM");
+			await new Promise<void>((resolve) => {
+				const timeout = setTimeout(() => {
+					this.process?.kill("SIGKILL");
+					resolve();
+				}, 3000);
+				this.process?.on("exit", () => {
+					clearTimeout(timeout);
+					resolve();
+				});
+			});
+		}
 		this.process = null;
 		this.pendingRequests.clear();
+		this.containerName = null;
 	}
 
 	onEvent(listener: (event: any) => void): () => void {
@@ -281,7 +342,7 @@ class SubAgentClient {
 	private send(command: Record<string, unknown>): Promise<any> {
 		if (!this.process?.stdin) throw new Error("Client not started");
 
-		const id = `req_${++this.requestId}`;
+		const id = randomUUID();
 		const full = { ...command, id };
 
 		return new Promise((resolve, reject) => {
@@ -450,12 +511,41 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 		},
 	});
 
+	// Credential proxy server instance (host-side)
+	let proxyServer: Server | null = null;
+
 	// Auto-start on session_start if required flags are provided (silent skip if missing)
 	pi.on("session_start", async (_event, ctx) => {
 		const repo = pi.getFlag("review-repo") as string | undefined;
 		const dataDir = pi.getFlag("review-data-dir") as string | undefined;
 		if (repo && dataDir) {
-			ctx.ui.notify(`Code review agent starting for ${repo}`, "info");
+			try {
+				// Initialize container infrastructure
+				// ensureRuntimeRunning() is omitted — launch.sh already checked Docker,
+				// and ensureImageBuilt() will fail with a clear error if Docker is down.
+				cleanupOrphans();
+				ensureImageBuilt(join(extensionDir, "container"));
+				const proxyHost = detectProxyBindHost();
+				proxyServer = await startCredentialProxy(CREDENTIAL_PROXY_PORT, proxyHost);
+				// Register cleanup only after proxy is started
+				// exit handler must be synchronous — use server.close() directly
+				process.once("exit", () => {
+					proxyServer?.close();
+				});
+				process.once("SIGTERM", () => {
+					const server = proxyServer;
+					proxyServer = null; // Prevent exit handler from double-closing
+					if (server) {
+						stopCredentialProxy(server).finally(() => process.exit(0));
+					} else {
+						process.exit(0);
+					}
+				});
+				ctx.ui.notify(`Code review agent starting for ${repo} (container mode)`, "info");
+			} catch (err: any) {
+				ctx.ui.notify(`Container setup failed: ${err.message}`, "error");
+				return;
+			}
 			startReviewLoop(repo, ctx);
 		}
 	});
@@ -690,8 +780,12 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 		const reviewSkillPath = join(skillsDir, "review");
 
 		const client = new SubAgentClient(piCliPath, {
-			cwd: repoDir,
-			args: ["--skill", reviewSkillPath, "--no-extensions"],
+			args: ["--skill", CONTAINER_PATHS.skill("review"), "--no-extensions"],
+			containerMode: {
+				repoDir,
+				stateDir: getStateDir(),
+				skillDirs: [reviewSkillPath],
+			},
 		});
 
 		let toolCallCount = 0;
@@ -717,7 +811,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 Use the "review" skill to guide your review process. Read the skill file to get detailed instructions.
 
 **Target file:** ${file}
-**Findings output path:** ${statePath("pending-findings.json")}
+**Findings output path:** ${CONTAINER_PATHS.stateFile("pending-findings.json")}
 
 Review the file thoroughly and write your findings as a JSON array to the output path.`,
 				LIMITS.reviewTimeoutMs,
@@ -791,8 +885,12 @@ Review the file thoroughly and write your findings as a JSON array to the output
 		const verifySkillPath = join(skillsDir, "verify");
 
 		const client = new SubAgentClient(piCliPath, {
-			cwd: repoDir,
-			args: ["--skill", verifySkillPath, "--no-extensions"],
+			args: ["--skill", CONTAINER_PATHS.skill("verify"), "--no-extensions"],
+			containerMode: {
+				repoDir,
+				stateDir: getStateDir(),
+				skillDirs: [verifySkillPath],
+			},
 		});
 
 		let toolCallCount = 0;
@@ -813,7 +911,7 @@ Review the file thoroughly and write your findings as a JSON array to the output
 		try {
 			await client.start();
 			await client.promptAndWait(
-				`You are verifying a code review finding before submitting it as a GitHub issue.
+				`You are verifying a code review finding.
 
 Use the "verify" skill to guide your verification process. Read the skill file to get detailed instructions.
 
@@ -822,9 +920,9 @@ Use the "verify" skill to guide your verification process. Read the skill file t
 \`\`\`json
 ${JSON.stringify(finding, null, 2)}
 \`\`\`
-**Result output path:** ${statePath("verify-result.json")}
+**Result output path:** ${CONTAINER_PATHS.stateFile("verify-result.json")}
 
-Verify this finding by re-reading the actual code, check for duplicates, and submit via gh issue create if valid. Write the result to the output path.`,
+IMPORTANT: Do NOT run any gh commands. Only verify the finding against actual code and write your decision as JSON to the output path.`,
 				LIMITS.verifyTimeoutMs,
 			);
 
@@ -850,11 +948,23 @@ Verify this finding by re-reading the actual code, check for duplicates, and sub
 			await client.stop();
 		}
 
-		// Process result
+		// Process result — gh operations happen on the host side
 		const result = readJson<VerifyResult>(statePath("verify-result.json"), { status: "rejected", reason: "No output", finding });
 
 		if (result.status === "submitted") {
-			ctx.ui.notify(`[Verify] Issue submitted: ${result.issueUrl ?? "unknown URL"}`, "info");
+			// Host-side: check for duplicates and create issue
+			const verifiedFinding = result.finding ?? finding;
+			const isDuplicate = checkDuplicateIssue(repo, verifiedFinding);
+			if (!isDuplicate) {
+				const issueUrl = createGitHubIssue(repo, verifiedFinding);
+				if (issueUrl) {
+					ctx.ui.notify(`[Verify] Issue submitted: ${issueUrl}`, "info");
+				} else {
+					ctx.ui.notify("[Verify] Finding verified but issue creation failed", "warning");
+				}
+			} else {
+				ctx.ui.notify("[Verify] Duplicate found, skipping issue creation", "info");
+			}
 		} else {
 			ctx.ui.notify(`[Verify] Finding rejected: ${result.reason ?? "unknown reason"}`, "info");
 		}

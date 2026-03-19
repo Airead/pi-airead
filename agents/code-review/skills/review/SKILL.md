@@ -44,7 +44,7 @@ Focus on these categories (in priority order):
 
 ### Step 4: Output Findings
 
-Write findings to the file specified in the prompt as JSON:
+Write findings to the output path specified in the prompt (typically `/workspace/state/pending-findings.json`) as JSON:
 
 ```json
 [
