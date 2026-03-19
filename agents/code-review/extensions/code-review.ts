@@ -381,6 +381,16 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 	const extensionDir = dirname(dirname(currentFile));
 	const skillsDir = join(extensionDir, "skills");
 
+	/** Emit a message to the conversation stream (scrolling, persistent). */
+	function emit(text: string): void {
+		pi.sendMessage({ customType: "review-monitor", content: text, display: true });
+	}
+
+	/** Emit a warning message to the conversation stream. */
+	function emitWarn(text: string): void {
+		pi.sendMessage({ customType: "review-warning", content: `⚠ ${text}`, display: true });
+	}
+
 	// Data subdirectories are lazily resolved from --review-data-dir flag
 	function getDataDir(): string {
 		const dataDir = pi.getFlag("review-data-dir") as string | undefined;
@@ -603,16 +613,16 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				}
 
 				const modeLabel = useProxy ? "container+proxy" : `container+direct (${config.provider})`;
-				ctx.ui.notify(`Code review agent ready for ${repo} (${modeLabel})`, "info");
+				emit(`Code review agent ready for ${repo} (${modeLabel})`);
 			} catch (err: any) {
-				ctx.ui.notify(`Container setup failed: ${err.message}`, "error");
+				emitWarn(`Container setup failed: ${err.message}`);
 				return;
 			}
 
 			if (pi.getFlag("review-auto-start")) {
 				startReviewLoop(repo, ctx);
 			} else {
-				ctx.ui.notify("Use /review-start to begin the review loop", "info");
+				emit("Use /review-start to begin the review loop");
 			}
 		}
 	});
@@ -655,7 +665,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			const actualInterval = baseIntervalMs * backoffMultiplier;
 			const hours = (actualInterval / 3600_000).toFixed(1);
 			loopTimer = setTimeout(loop, actualInterval);
-			ctx.ui.notify(`Next review in ${hours} hour(s)`, "info");
+			emit(`Next review in ${hours} hour(s)`);
 		};
 
 		const loop = async () => {
@@ -664,7 +674,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 
 				const blocked = checkSafetyGatesLocal();
 				if (blocked) {
-					ctx.ui.notify(blocked, "warning");
+					emitWarn(blocked);
 					// Check again in 1 hour (e.g., daily limit may reset at midnight)
 					if (loopActive) loopTimer = setTimeout(loop, 3600_000);
 					return;
@@ -680,21 +690,18 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 
 				// Circuit breaker (re-check after cycle, since runCycle may have incremented failures)
 				if (consecutiveFailures >= LIMITS.maxConsecutiveFailures) {
-					ctx.ui.notify(
-						`Circuit breaker: ${consecutiveFailures} consecutive failures. Loop stopped. Use /review-start to resume.`,
-						"error",
-					);
+					emitWarn(`Circuit breaker: ${consecutiveFailures} consecutive failures. Loop stopped. Use /review-start to resume.`);
 					loopActive = false;
 					return;
 				}
 
 				scheduleNext();
 			} catch (err: any) {
-				ctx.ui.notify(`Loop error: ${err.message}`, "error");
+				emitWarn(`Loop error: ${err.message}`);
 				consecutiveFailures++;
 				if (consecutiveFailures >= LIMITS.maxConsecutiveFailures) {
 					loopActive = false;
-					ctx.ui.notify("Circuit breaker triggered from loop error. Loop stopped.", "error");
+					emitWarn("Circuit breaker triggered from loop error. Loop stopped.");
 				} else {
 					scheduleNext();
 				}
@@ -725,7 +732,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 
 			if (prevCycle.status === "verifying" && prevCycle.file) {
 				// Resume from verification
-				ctx.ui.notify(`Recovering: resuming verification for ${prevCycle.file}`, "info");
+				emit(`Recovering: resuming verification for ${prevCycle.file}`);
 				await runVerifyRound(repo, ctx);
 				finishCycle(repo, prevCycle.file);
 				consecutiveFailures = 0;
@@ -736,7 +743,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 
 			if (prevCycle.status !== "idle" && prevCycle.file) {
 				// Other incomplete states: restart the file
-				ctx.ui.notify(`Recovering: restarting review for ${prevCycle.file}`, "info");
+				emit(`Recovering: restarting review for ${prevCycle.file}`);
 			}
 
 			// Step 1: Select file
@@ -747,9 +754,9 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				return true;
 			}
 
-			ctx.ui.notify("────────────────────────────────────────", "info");
-			ctx.ui.notify(`Reviewing: ${file}`, "info");
-			ctx.ui.notify("────────────────────────────────────────", "info");
+			emit("────────────────────────────────────────");
+			emit(`Reviewing: ${file}`);
+			emit("────────────────────────────────────────");
 
 			// Step 2: Review round
 			updateCycleState({ status: "reviewing", file, repo, startedAt: new Date().toISOString() });
@@ -761,7 +768,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				updateCycleState({ status: "verifying", file, repo, startedAt: new Date().toISOString() });
 				await runVerifyRound(repo, ctx);
 			} else {
-				ctx.ui.notify("No findings to verify", "info");
+				emit("No findings to verify");
 			}
 
 			// Step 4: Finish
@@ -774,10 +781,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			return true;
 		} catch (err: any) {
 			consecutiveFailures++;
-			ctx.ui.notify(
-				`Review cycle error (failure ${consecutiveFailures}/${LIMITS.maxConsecutiveFailures}): ${err.message}`,
-				"error",
-			);
+			emitWarn(`Review cycle error (failure ${consecutiveFailures}/${LIMITS.maxConsecutiveFailures}): ${err.message}`);
 			updateCycleState({ status: "idle" });
 			return true; // Cycle ran but failed — still counts as "attempted"
 		} finally {
@@ -902,15 +906,15 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 		return lines;
 	}
 
-	/** Emit stats summary as multiple lines to the host UI. */
-	function emitStatsSummary(stats: SubAgentStats, ctx: any, prefix: string): void {
-		ctx.ui.notify(`[${prefix}]   tool calls:  ${stats.toolCalls}`, "info");
-		ctx.ui.notify(`[${prefix}]   input:       ${stats.input} tokens`, "info");
-		ctx.ui.notify(`[${prefix}]   output:      ${stats.output} tokens`, "info");
-		ctx.ui.notify(`[${prefix}]   cache-read:  ${stats.cacheRead} tokens`, "info");
-		ctx.ui.notify(`[${prefix}]   cache-write: ${stats.cacheWrite} tokens`, "info");
+	/** Emit stats summary as multiple lines to the conversation stream. */
+	function emitStatsSummary(stats: SubAgentStats, prefix: string): void {
+		emit(`[${prefix}]   tool calls:  ${stats.toolCalls}`);
+		emit(`[${prefix}]   input:       ${stats.input} tokens`);
+		emit(`[${prefix}]   output:      ${stats.output} tokens`);
+		emit(`[${prefix}]   cache-read:  ${stats.cacheRead} tokens`);
+		emit(`[${prefix}]   cache-write: ${stats.cacheWrite} tokens`);
 		if (stats.cost > 0) {
-			ctx.ui.notify(`[${prefix}]   cost:        $${stats.cost.toFixed(4)}`, "info");
+			emit(`[${prefix}]   cost:        $${stats.cost.toFixed(4)}`);
 		}
 	}
 
@@ -920,7 +924,6 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 	 */
 	function setupSubAgentMonitor(
 		client: SubAgentClient,
-		ctx: any,
 		prefix: string,
 	): { unsubscribe: () => void; getStats: () => SubAgentStats } {
 		const stats: SubAgentStats = { toolCalls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
@@ -929,20 +932,20 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			if (event.type === "tool_execution_start") {
 				stats.toolCalls++;
 				const argSummary = formatToolArgs(event.toolName, event.args);
-				ctx.ui.notify(`[${prefix}] → ${event.toolName} (${stats.toolCalls}/${LIMITS.maxToolCallsPerSubAgent})`, "info");
+				emit(`[${prefix}] → ${event.toolName} (${stats.toolCalls}/${LIMITS.maxToolCallsPerSubAgent})`);
 				if (argSummary) {
-					ctx.ui.notify(`[${prefix}]   args: ${argSummary}`, "info");
+					emit(`[${prefix}]   args: ${argSummary}`);
 				}
 				if (stats.toolCalls >= LIMITS.maxToolCallsPerSubAgent) {
-					ctx.ui.notify(`[${prefix}]   ⚠ Tool call limit reached, aborting sub-agent`, "warning");
+					emitWarn(`[${prefix}] Tool call limit reached, aborting sub-agent`);
 					client.abort().catch(() => {});
 				}
 			}
 
 			if (event.type === "tool_execution_end") {
 				const resultSummary = formatToolResult(event.toolName, event.result, event.isError);
-				ctx.ui.notify(`[${prefix}] ← ${event.toolName}`, "info");
-				ctx.ui.notify(`[${prefix}]   result: ${resultSummary}`, "info");
+				emit(`[${prefix}] ← ${event.toolName}`);
+				emit(`[${prefix}]   result: ${resultSummary}`);
 			}
 
 			// Accumulate token usage from assistant messages and show per-turn delta
@@ -959,10 +962,10 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				stats.cacheWrite += turnCacheWrite;
 				stats.cost += turnCost;
 				// Show per-turn token consumption
-				ctx.ui.notify(`[${prefix}] :: turn tokens`, "info");
-				ctx.ui.notify(`[${prefix}]   input: ${turnIn}  output: ${turnOut}  cache-read: ${turnCacheRead}  cache-write: ${turnCacheWrite}`, "info");
+				emit(`[${prefix}] :: turn tokens`);
+				emit(`[${prefix}]   input: ${turnIn}  output: ${turnOut}  cache-read: ${turnCacheRead}  cache-write: ${turnCacheWrite}`);
 				if (turnCost > 0) {
-					ctx.ui.notify(`[${prefix}]   cost: $${turnCost.toFixed(4)}`, "info");
+					emit(`[${prefix}]   cost: $${turnCost.toFixed(4)}`);
 				}
 			}
 		});
@@ -1026,7 +1029,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 
 		const client = createSubAgent("review");
 
-		const monitor = setupSubAgentMonitor(client, ctx, "Review");
+		const monitor = setupSubAgentMonitor(client, "Review");
 
 		try {
 			await client.start();
@@ -1048,26 +1051,26 @@ Review the file thoroughly and write your findings as a JSON array to the output
 			await client.stop();
 		}
 
-		ctx.ui.notify(`[Review] Done`, "info");
-		emitStatsSummary(monitor.getStats(), ctx, "Review");
+		emit(`[Review] Done`);
+		emitStatsSummary(monitor.getStats(), "Review");
 
 		// Merge new findings into cache (validate sub-agent output)
 		const rawFindings = readJson<unknown[]>(statePath("pending-findings.json"), []);
 		const newFindings = filterValidFindings(rawFindings);
 		const discarded = rawFindings.length - newFindings.length;
 		if (discarded > 0) {
-			ctx.ui.notify(`[Review] Discarded ${discarded} malformed finding(s)`, "warning");
+			emitWarn(`[Review] Discarded ${discarded} malformed finding(s)`);
 		}
 		if (newFindings.length > 0) {
-			ctx.ui.notify(`[Review] Found ${newFindings.length} issue(s) in ${file}:`, "info");
+			emit(`[Review] Found ${newFindings.length} issue(s) in ${file}:`);
 			for (const f of newFindings) {
 				for (const line of formatFindingDetails(f)) {
-					ctx.ui.notify(`[Review]   ${line}`, "info");
+					emit(`[Review]   ${line}`);
 				}
 			}
 			mergeFindingsCache(newFindings);
 		} else {
-			ctx.ui.notify(`[Review] No issues found in ${file}`, "info");
+			emit(`[Review] No issues found in ${file}`);
 		}
 	}
 
@@ -1087,10 +1090,10 @@ Review the file thoroughly and write your findings as a JSON array to the output
 
 		// Take the top finding
 		const finding = cache[0];
-		ctx.ui.notify("────────────────────────────────────────", "info");
-		ctx.ui.notify(`[Verify] Checking: ${finding.title}`, "info");
-		ctx.ui.notify(`[Verify]   file: ${finding.file}:${finding.line}-${finding.endLine}`, "info");
-		ctx.ui.notify(`[Verify]   severity: ${finding.severity}  category: ${finding.category}`, "info");
+		emit("────────────────────────────────────────");
+		emit(`[Verify] Checking: ${finding.title}`);
+		emit(`[Verify]   file: ${finding.file}:${finding.line}-${finding.endLine}`);
+		emit(`[Verify]   severity: ${finding.severity}  category: ${finding.category}`);
 
 		// Clean previous output
 		const verifyPath = statePath("verify-result.json");
@@ -1103,7 +1106,7 @@ Review the file thoroughly and write your findings as a JSON array to the output
 
 		const client = createSubAgent("verify");
 
-		const monitor = setupSubAgentMonitor(client, ctx, "Verify");
+		const monitor = setupSubAgentMonitor(client, "Verify");
 
 		try {
 			await client.start();
@@ -1129,36 +1132,33 @@ IMPORTANT: Do NOT run any gh commands. Only verify the finding against actual co
 			await client.stop();
 		}
 
-		ctx.ui.notify(`[Verify] Done`, "info");
-		emitStatsSummary(monitor.getStats(), ctx, "Verify");
+		emit(`[Verify] Done`);
+		emitStatsSummary(monitor.getStats(), "Verify");
 
 		// Process result — gh operations happen on the host side
 		const result = readJson<VerifyResult>(statePath("verify-result.json"), { status: "rejected", reason: "No output", finding });
 
 		if (result.status === "submitted") {
 			const verifiedFinding = result.finding ?? finding;
-			ctx.ui.notify("[Verify] CONFIRMED:", "info");
+			emit("[Verify] CONFIRMED:");
 			for (const line of formatFindingDetails(verifiedFinding)) {
-				ctx.ui.notify(`[Verify]   ${line}`, "info");
+				emit(`[Verify]   ${line}`);
 			}
 			// Host-side: check for duplicates and create issue
 			const isDuplicate = checkDuplicateIssue(repo, verifiedFinding);
 			if (!isDuplicate) {
 				const issueUrl = createGitHubIssue(repo, verifiedFinding);
 				if (issueUrl) {
-					ctx.ui.notify(`[Verify] Issue created: ${issueUrl}`, "info");
+					emit(`[Verify] Issue created: ${issueUrl}`);
 				} else {
-					ctx.ui.notify("[Verify] Finding verified but issue creation failed", "warning");
+					emitWarn("[Verify] Finding verified but issue creation failed");
 				}
 			} else {
-				ctx.ui.notify("[Verify] Duplicate found, skipping issue creation", "info");
+				emit("[Verify] Duplicate found, skipping issue creation");
 			}
 		} else {
-			ctx.ui.notify(`[Verify] REJECTED: ${result.reason ?? "unknown reason"}`, "info");
-			ctx.ui.notify(
-				`[Verify]   was: [${finding.severity}/${finding.category}] ${finding.title} (${finding.file}:${finding.line})`,
-				"info",
-			);
+			emit(`[Verify] REJECTED: ${result.reason ?? "unknown reason"}`);
+			emit(`[Verify]   was: [${finding.severity}/${finding.category}] ${finding.title} (${finding.file}:${finding.line})`);
 		}
 
 		// Remove processed finding from cache (always remove, whether submitted or rejected)
