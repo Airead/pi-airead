@@ -754,9 +754,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				return true;
 			}
 
-			emit("────────────────────────────────────────");
-			emit(`Reviewing: ${file}`);
-			emit("────────────────────────────────────────");
+			emit(`────────────────────────────────────────\nReviewing: ${file}\n────────────────────────────────────────`);
 
 			// Step 2: Review round
 			updateCycleState({ status: "reviewing", file, repo, startedAt: new Date().toISOString() });
@@ -906,16 +904,20 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 		return lines;
 	}
 
-	/** Emit stats summary as multiple lines to the conversation stream. */
-	function emitStatsSummary(stats: SubAgentStats, prefix: string): void {
-		emit(`[${prefix}]   tool calls:  ${stats.toolCalls}`);
-		emit(`[${prefix}]   input:       ${stats.input} tokens`);
-		emit(`[${prefix}]   output:      ${stats.output} tokens`);
-		emit(`[${prefix}]   cache-read:  ${stats.cacheRead} tokens`);
-		emit(`[${prefix}]   cache-write: ${stats.cacheWrite} tokens`);
+	/** Format stats summary as a single multi-line string. */
+	function formatStatsSummary(stats: SubAgentStats, prefix: string): string {
+		const lines = [
+			`[${prefix}] Done`,
+			`  tool calls:  ${stats.toolCalls}`,
+			`  input:       ${stats.input} tokens`,
+			`  output:      ${stats.output} tokens`,
+			`  cache-read:  ${stats.cacheRead} tokens`,
+			`  cache-write: ${stats.cacheWrite} tokens`,
+		];
 		if (stats.cost > 0) {
-			emit(`[${prefix}]   cost:        $${stats.cost.toFixed(4)}`);
+			lines.push(`  cost:        $${stats.cost.toFixed(4)}`);
 		}
+		return lines.join("\n");
 	}
 
 	/**
@@ -932,10 +934,9 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			if (event.type === "tool_execution_start") {
 				stats.toolCalls++;
 				const argSummary = formatToolArgs(event.toolName, event.args);
-				emit(`[${prefix}] → ${event.toolName} (${stats.toolCalls}/${LIMITS.maxToolCallsPerSubAgent})`);
-				if (argSummary) {
-					emit(`[${prefix}]   args: ${argSummary}`);
-				}
+				let msg = `[${prefix}] → ${event.toolName} (${stats.toolCalls}/${LIMITS.maxToolCallsPerSubAgent})`;
+				if (argSummary) msg += `\n  args: ${argSummary}`;
+				emit(msg);
 				if (stats.toolCalls >= LIMITS.maxToolCallsPerSubAgent) {
 					emitWarn(`[${prefix}] Tool call limit reached, aborting sub-agent`);
 					client.abort().catch(() => {});
@@ -944,8 +945,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 
 			if (event.type === "tool_execution_end") {
 				const resultSummary = formatToolResult(event.toolName, event.result, event.isError);
-				emit(`[${prefix}] ← ${event.toolName}`);
-				emit(`[${prefix}]   result: ${resultSummary}`);
+				emit(`[${prefix}] ← ${event.toolName}\n  result: ${resultSummary}`);
 			}
 
 			// Accumulate token usage from assistant messages and show per-turn delta
@@ -961,12 +961,9 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				stats.cacheRead += turnCacheRead;
 				stats.cacheWrite += turnCacheWrite;
 				stats.cost += turnCost;
-				// Show per-turn token consumption
-				emit(`[${prefix}] :: turn tokens`);
-				emit(`[${prefix}]   input: ${turnIn}  output: ${turnOut}  cache-read: ${turnCacheRead}  cache-write: ${turnCacheWrite}`);
-				if (turnCost > 0) {
-					emit(`[${prefix}]   cost: $${turnCost.toFixed(4)}`);
-				}
+				let msg = `[${prefix}] :: turn tokens\n  input: ${turnIn}  output: ${turnOut}  cache-read: ${turnCacheRead}  cache-write: ${turnCacheWrite}`;
+				if (turnCost > 0) msg += `\n  cost: $${turnCost.toFixed(4)}`;
+				emit(msg);
 			}
 		});
 
@@ -1051,8 +1048,7 @@ Review the file thoroughly and write your findings as a JSON array to the output
 			await client.stop();
 		}
 
-		emit(`[Review] Done`);
-		emitStatsSummary(monitor.getStats(), "Review");
+		emit(formatStatsSummary(monitor.getStats(), "Review"));
 
 		// Merge new findings into cache (validate sub-agent output)
 		const rawFindings = readJson<unknown[]>(statePath("pending-findings.json"), []);
@@ -1062,12 +1058,10 @@ Review the file thoroughly and write your findings as a JSON array to the output
 			emitWarn(`[Review] Discarded ${discarded} malformed finding(s)`);
 		}
 		if (newFindings.length > 0) {
-			emit(`[Review] Found ${newFindings.length} issue(s) in ${file}:`);
-			for (const f of newFindings) {
-				for (const line of formatFindingDetails(f)) {
-					emit(`[Review]   ${line}`);
-				}
-			}
+			const findingLines = newFindings.flatMap((f) =>
+				formatFindingDetails(f).map((line) => `  ${line}`),
+			);
+			emit(`[Review] Found ${newFindings.length} issue(s) in ${file}:\n${findingLines.join("\n")}`);
 			mergeFindingsCache(newFindings);
 		} else {
 			emit(`[Review] No issues found in ${file}`);
@@ -1090,10 +1084,7 @@ Review the file thoroughly and write your findings as a JSON array to the output
 
 		// Take the top finding
 		const finding = cache[0];
-		emit("────────────────────────────────────────");
-		emit(`[Verify] Checking: ${finding.title}`);
-		emit(`[Verify]   file: ${finding.file}:${finding.line}-${finding.endLine}`);
-		emit(`[Verify]   severity: ${finding.severity}  category: ${finding.category}`);
+		emit(`────────────────────────────────────────\n[Verify] Checking: ${finding.title}\n  file: ${finding.file}:${finding.line}-${finding.endLine}\n  severity: ${finding.severity}  category: ${finding.category}`);
 
 		// Clean previous output
 		const verifyPath = statePath("verify-result.json");
@@ -1132,18 +1123,15 @@ IMPORTANT: Do NOT run any gh commands. Only verify the finding against actual co
 			await client.stop();
 		}
 
-		emit(`[Verify] Done`);
-		emitStatsSummary(monitor.getStats(), "Verify");
+		emit(formatStatsSummary(monitor.getStats(), "Verify"));
 
 		// Process result — gh operations happen on the host side
 		const result = readJson<VerifyResult>(statePath("verify-result.json"), { status: "rejected", reason: "No output", finding });
 
 		if (result.status === "submitted") {
 			const verifiedFinding = result.finding ?? finding;
-			emit("[Verify] CONFIRMED:");
-			for (const line of formatFindingDetails(verifiedFinding)) {
-				emit(`[Verify]   ${line}`);
-			}
+			const details = formatFindingDetails(verifiedFinding).map((l) => `  ${l}`).join("\n");
+			emit(`[Verify] CONFIRMED:\n${details}`);
 			// Host-side: check for duplicates and create issue
 			const isDuplicate = checkDuplicateIssue(repo, verifiedFinding);
 			if (!isDuplicate) {
@@ -1157,8 +1145,7 @@ IMPORTANT: Do NOT run any gh commands. Only verify the finding against actual co
 				emit("[Verify] Duplicate found, skipping issue creation");
 			}
 		} else {
-			emit(`[Verify] REJECTED: ${result.reason ?? "unknown reason"}`);
-			emit(`[Verify]   was: [${finding.severity}/${finding.category}] ${finding.title} (${finding.file}:${finding.line})`);
+			emit(`[Verify] REJECTED: ${result.reason ?? "unknown reason"}\n  was: [${finding.severity}/${finding.category}] ${finding.title} (${finding.file}:${finding.line})`);
 		}
 
 		// Remove processed finding from cache (always remove, whether submitted or rejected)
