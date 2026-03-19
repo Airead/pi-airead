@@ -745,24 +745,30 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			// Check for incomplete cycle from crash recovery
 			const prevCycle = readJson<CycleState>(statePath("cycle.json"), { status: "idle" });
 
-			if (prevCycle.status === "verifying" && prevCycle.file) {
+			// Validate recovery file still passes filters (e.g., test files may have been excluded)
+			const recoveryFile = prevCycle.file && isCodeFile(prevCycle.file) ? prevCycle.file : undefined;
+
+			if (prevCycle.status === "verifying" && recoveryFile) {
 				// Resume from verification
-				emit(`Recovering: resuming verification for ${prevCycle.file}`);
+				emit(`Recovering: resuming verification for ${recoveryFile}`);
 				await runVerifyRound(repo, ctx);
-				finishCycle(repo, prevCycle.file);
+				finishCycle(repo, recoveryFile);
 				consecutiveFailures = 0;
 				cleanupOldSessions(statePath("sessions.json"), LIMITS.sessionRetentionDays);
 				trimReviewedFiles(statePath("reviewed-files.json"), repo, LIMITS.maxReviewedFilesPerRepo);
 				return true;
 			}
 
-			if (prevCycle.status !== "idle" && prevCycle.file) {
-				// Other incomplete states: restart the file
-				emit(`Recovering: restarting review for ${prevCycle.file}`);
+			if (prevCycle.status !== "idle" && recoveryFile) {
+				emit(`Recovering: restarting review for ${recoveryFile}`);
+			} else if (prevCycle.status !== "idle") {
+				// Previous file no longer valid (e.g., excluded by filter), reset to idle
+				emit(`Skipping recovery for ${prevCycle.file ?? "unknown"} (file excluded by filter)`);
+				updateCycleState({ status: "idle" });
 			}
 
 			// Step 1: Select file
-			const file = selectFile(repo, prevCycle.status !== "idle" ? prevCycle.file : undefined);
+			const file = selectFile(repo, recoveryFile);
 			if (!file) {
 				// All files reviewed is not a failure — just skip this cycle without penalizing
 				updateCycleState({ status: "idle" });
