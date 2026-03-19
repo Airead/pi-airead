@@ -68,7 +68,7 @@ Once the agent is running, you can use these commands in the pi terminal:
 ```
 agents/code-review/               # Project directory (checked into git)
 ├── prompts/
-│   ├── system.md                  # System prompt (--system-prompt)
+│   ├── APPEND_SYSTEM.md            # Appended system prompt (--append-system-prompt)
 │   └── agents.md                  # Project instructions (--append-system-prompt)
 ├── extensions/
 │   ├── code-review.ts             # Main extension: scheduling, RPC, state

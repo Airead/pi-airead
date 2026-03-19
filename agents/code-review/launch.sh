@@ -154,7 +154,7 @@ echo ""
 cd "$REPO_DIR"
 
 exec pi \
-    --system-prompt "$SCRIPT_DIR/prompts/system.md" \
+    --append-system-prompt "$SCRIPT_DIR/prompts/APPEND_SYSTEM.md" \
     --append-system-prompt "$SCRIPT_DIR/prompts/agents.md" \
     -e "$SCRIPT_DIR/extensions/code-review.ts" \
     --skill "$SCRIPT_DIR/skills/review" \
