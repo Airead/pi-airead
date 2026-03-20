@@ -7,7 +7,7 @@ An autonomous AI agent that periodically reviews code in a GitHub repository and
 The agent runs in a loop:
 
 1. **Select File** — Randomly picks an unreviewed code file
-2. **Review (Round 1)** — Spawns a sub-agent in a Docker container to deeply review the file for bugs, security issues, performance problems, and design flaws
+2. **Review (Round 1)** — Spawns a sub-agent in an isolated container to deeply review the file for bugs, security issues, performance problems, and design flaws
 3. **Verify (Round 2)** — Spawns another containerized sub-agent to verify the top finding by re-reading the actual code. If verified, the host orchestrator checks for duplicates and submits a GitHub issue
 4. **Wait** — Waits for the configured interval before starting the next cycle
 
@@ -15,8 +15,8 @@ The agent runs in a loop:
 
 - **Two-round review**: Round 1 generates findings, Round 2 verifies them against real code. This reduces false positives.
 - **One issue per cycle**: Only the most severe finding is submitted each cycle. Others are cached (max 10) for future evaluation.
-- **Container isolation**: Each sub-agent runs inside a Docker container with the repo mounted read-only, no real API keys (injected via a credential proxy), resource limits (2 GB memory, 2 CPUs, 256 PIDs), and `.env` files shadowed. All GitHub operations (issue creation, duplicate checks) happen on the host side.
-- **Sub-agent RPC**: Communication uses JSON-RPC over stdin/stdout (`docker run -i` + `pi --mode rpc`), preserving real-time tool call monitoring and abort capabilities.
+- **Container isolation**: Each sub-agent runs inside a container (Docker or Apple Container) with the repo mounted read-only, no real API keys (injected via a credential proxy), resource limits (2 GB memory, 2 CPUs), and `.env` files shadowed. All GitHub operations (issue creation, duplicate checks) happen on the host side.
+- **Sub-agent RPC**: Communication uses JSON-RPC over stdin/stdout (`<runtime> run -i` + `pi --mode rpc`), preserving real-time tool call monitoring and abort capabilities.
 - **Findings cache**: Findings accumulate across cycles, sorted by severity. Low-priority findings get naturally displaced by higher-severity ones.
 - **Crash recovery**: A state machine (`cycle.json`) tracks progress. If the agent crashes mid-cycle, it resumes from the last checkpoint.
 - **External data directory**: All runtime data (state, cloned repos) lives outside the project directory, specified via `--data-dir`.
@@ -26,7 +26,9 @@ The agent runs in a loop:
 
 - [pi-coding-agent](https://github.com/nicobrinkkemper/pi-mono) installed and in PATH
 - [GitHub CLI](https://cli.github.com/) (`gh`) installed and authenticated
-- [Docker](https://www.docker.com/) installed and running
+- A container runtime (one of):
+  - [Docker](https://www.docker.com/) installed and running (default)
+  - [Apple Container](https://github.com/apple/container) for native macOS containers (lighter, faster startup)
 - An API key for your chosen provider (e.g., `ANTHROPIC_API_KEY`, `ZAI_API_KEY`, `OPENAI_API_KEY`)
 
 ## Usage
@@ -44,13 +46,14 @@ The agent runs in a loop:
 | `--interval <hours>` | No | Hours between review cycles (default: 1, range: 0.1–24) |
 | `--provider <name>` | No | AI provider (default: `anthropic`). Supported: `anthropic`, `zai`, `openai`, `google`, `groq`, `xai`, etc. |
 | `--model <id>` | No | Model ID for the provider (e.g., `glm-5`, `gpt-4o-mini`) |
+| `--runtime <name>` | No | Container runtime: `docker` (default) or `apple-container` |
 | `--auto-start` | No | Automatically start the review loop on launch (default: wait for `/review-start`) |
 | `--skill-suffix <str>` | No | Suffix for skill directories (e.g., `-test` for dry-run mode) |
 
 ### Examples
 
 ```bash
-# Review with Anthropic (default provider)
+# Review with Anthropic (default provider, Docker runtime)
 ./launch.sh --repo facebook/react --data-dir /tmp/cr-data
 
 # Review with ZAI provider using glm-5
@@ -58,6 +61,9 @@ The agent runs in a loop:
 
 # Auto-start with 2-hour interval
 ./launch.sh --repo myorg/myrepo --data-dir /tmp/cr-data --interval 2 --auto-start
+
+# Use Apple Container runtime (macOS)
+./launch.sh --repo myorg/myrepo --data-dir /tmp/cr-data --runtime apple-container
 ```
 
 ### Interactive Commands
@@ -74,7 +80,7 @@ Once the agent is running, you can use these commands in the pi terminal:
 
 ## E2E Testing
 
-The e2e test script runs the full scheduling pipeline (Docker, RPC, monitoring, state management) without performing real code reviews or creating GitHub issues.
+The e2e test script runs the full scheduling pipeline (container, RPC, monitoring, state management) without performing real code reviews or creating GitHub issues.
 
 It uses dry-run skill files: `review-test` writes empty findings, `verify-test` always rejects — so **no GitHub issues are ever created**.
 
@@ -87,6 +93,9 @@ It uses dry-run skill files: `review-test` writes empty findings, `verify-test` 
 # With provider/model flags
 ./e2e-test.sh airead/WenZi --provider zai --model glm-5
 
+# With Apple Container runtime
+./e2e-test.sh airead/WenZi --runtime apple-container
+
 # Or set env vars once, then just pass repo
 export REVIEW_PROVIDER=zai REVIEW_MODEL=glm-5
 ./e2e-test.sh airead/WenZi
@@ -96,7 +105,7 @@ export REVIEW_PROVIDER=zai REVIEW_MODEL=glm-5
 
 1. Creates a temporary data directory
 2. Launches the agent with `--interval 0.1` (6-minute cycles), `--auto-start`, and `--skill-suffix "-test"`
-3. Sub-agents run in real Docker containers but do minimal work (1–2 API calls per round)
+3. Sub-agents run in real containers but do minimal work (1–2 API calls per round)
 4. On exit (`Ctrl+C`), prints a summary: cycle state, reviewed file count, findings cache size, and checks for accidentally created issues
 
 ### What to Observe
@@ -126,8 +135,9 @@ echo '{"date":"2026-03-20","cycleCount":19}' > "$STATE_DIR/daily-stats.json"
 ```
 agents/code-review/               # Project directory (checked into git)
 ├── container/
-│   ├── Dockerfile                 # Sub-agent container image (node + git, non-root)
-│   └── build.sh                   # Standalone image build script
+│   ├── Dockerfile                 # Sub-agent container image (node + git)
+│   ├── entrypoint.sh              # Container entrypoint (handles .env shadowing + privilege drop)
+│   └── build.sh                   # Standalone image build script (supports Docker and Apple Container)
 ├── prompts/
 │   ├── APPEND_SYSTEM.md            # Appended system prompt (--append-system-prompt)
 │   └── agents.md                  # Project instructions (--append-system-prompt)
@@ -137,7 +147,7 @@ agents/code-review/               # Project directory (checked into git)
 │   ├── code-review-utils.test.ts  # Tests for utils
 │   ├── code-review-scheduler.ts   # Pure scheduling decision functions
 │   ├── code-review-scheduler.test.ts # Tests for scheduler
-│   ├── container-runtime.ts       # Docker runtime abstraction (mounts, env, resource limits)
+│   ├── container-runtime.ts       # Container runtime abstraction (Docker + Apple Container)
 │   ├── container-runtime.test.ts  # Tests for container runtime
 │   ├── credential-proxy.ts        # HTTP proxy that injects API key for containers
 │   └── credential-proxy.test.ts   # Tests for credential proxy
@@ -150,7 +160,7 @@ agents/code-review/               # Project directory (checked into git)
 │   │   └── SKILL.md               # Dry-run review (writes empty findings)
 │   └── verify-test/
 │       └── SKILL.md               # Dry-run verify (always rejects)
-├── launch.sh                      # Entry point (checks Docker, builds image, clones repo)
+├── launch.sh                      # Entry point (checks runtime, builds image, clones repo)
 ├── e2e-test.sh                    # E2E test launcher (dry-run mode)
 └── README.md
 
@@ -192,23 +202,50 @@ agents/code-review/               # Project directory (checked into git)
 | Sub-agent timeout | 5 min (review), 3 min (verify) | Hard timeout per round. |
 | Session retention | 7 days | Old sub-agent session files are cleaned up after each successful cycle. |
 | Reviewed files cap | 5000 per repo | When exceeded, the oldest half is trimmed. |
-| Container memory | 2 GB | Docker `--memory` limit per sub-agent container. |
-| Container CPUs | 2 | Docker `--cpus` limit per sub-agent container. |
-| Container PIDs | 256 | Docker `--pids-limit` to prevent fork bombs. |
+| Container memory | 2 GB | `--memory` limit per sub-agent container. |
+| Container CPUs | 2 | `--cpus` limit per sub-agent container. |
+| Container PIDs | 256 | `--pids-limit` to prevent fork bombs (Docker only; not supported by Apple Container). |
 
 ## Container Security
 
-Sub-agents run inside Docker containers to mitigate prompt injection from audited code:
+Sub-agents run inside isolated containers to mitigate prompt injection from audited code:
 
 | Threat | Mitigation |
 |--------|------------|
-| Code tampering | Repository mounted read-only (`-v repo:ro`) |
+| Code tampering | Repository mounted read-only |
 | Credential theft | Credential proxy injects API key; containers only see a placeholder |
-| `.env` file leaks | `.env` files shadowed with `/dev/null` mounts |
+| `.env` file leaks | Docker: shadowed with `/dev/null` file mounts. Apple Container: shadowed via `mount --bind` in entrypoint |
 | Git hook execution | `GIT_CONFIG_NOSYSTEM=1` disables system git config |
-| Resource exhaustion | `--memory=2g --cpus=2 --pids-limit=256` |
-| Container escape | Non-root user, no `--privileged`, no `docker.sock` mount |
+| Resource exhaustion | `--memory=2g --cpus=2 --pids-limit=256` (PIDs limit Docker only) |
+| Container escape | Non-root user (Docker: `--user 1000:1000`; Apple Container: entrypoint drops privileges), no `--privileged`, no docker.sock mount |
 | Unauthorized GitHub actions | All `gh` commands run on host side only; containers have no `gh` access |
+
+### Apple Container Notes
+
+When using `--runtime apple-container`:
+
+- **NAT setup** is required **only for non-anthropic providers** (containers need direct internet access to reach external APIs). Anthropic provider routes through the host-side credential proxy, so no NAT is needed.
+
+  Apple Container uses vmnet with a private subnet (typically `192.168.64.0/24`). To allow containers to reach the internet, you need to enable IP forwarding and configure NAT:
+  ```bash
+  # ⚠ Back up current pf firewall rules first
+  sudo pfctl -sn > /tmp/pf-nat-backup.txt 2>/dev/null
+  sudo pfctl -sr > /tmp/pf-filter-backup.txt 2>/dev/null
+
+  # Enable IP forwarding and add NAT rule (preserves existing system rules)
+  sudo sysctl -w net.inet.ip.forwarding=1
+  (echo "nat on en0 from 192.168.64.0/24 to any -> (en0)"; cat /etc/pf.conf) | sudo pfctl -f -
+  sudo pfctl -e 2>/dev/null
+
+  # Restore original rules when done
+  sudo pfctl -f /etc/pf.conf
+  ```
+  All changes are **temporary** — a reboot restores all defaults. If you need to restore immediately, run `sudo pfctl -f /etc/pf.conf`.
+
+  > **Note**: Replace `en0` with your active network interface (check with `ifconfig`). The subnet may vary across Apple Container versions. See [Apple Container networking docs](https://github.com/apple/container) for authoritative guidance.
+  Anthropic provider routes through the host-side credential proxy, so NAT is not needed.
+- **IPv4 DNS**: `NODE_OPTIONS=--dns-result-order=ipv4first` is set automatically (Apple Container NAT is IPv4 only).
+- **Separate image store**: Docker and Apple Container do not share images. You must build the image separately for each runtime (`build.sh` respects `CONTAINER_RUNTIME`).
 
 ## GitHub Issues
 
