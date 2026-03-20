@@ -8,6 +8,7 @@ import {
 	CONTAINER_HOST_GATEWAY,
 	CONTAINER_IMAGE,
 	currentRuntime,
+	_resetCaches,
 	detectHostDns,
 	detectProxyBindHost,
 	findEnvFiles,
@@ -34,12 +35,13 @@ beforeEach(() => {
 
 afterEach(() => {
 	rmSync(testDir, { recursive: true, force: true });
-	// Restore original env
+	// Restore original env and clear cached runtime
 	if (originalRuntime === undefined) {
 		delete process.env.CONTAINER_RUNTIME;
 	} else {
 		process.env.CONTAINER_RUNTIME = originalRuntime;
 	}
+	_resetCaches();
 	vi.restoreAllMocks();
 });
 
@@ -90,7 +92,7 @@ describe("runtimeBin", () => {
 });
 
 // ============================================================================
-// detectProxyBindHost
+// detectHostDns
 // ============================================================================
 
 describe("detectHostDns", () => {

@@ -226,27 +226,8 @@ mkdir -p "$STATE_DIR"
 # Ensure container image is built
 # --------------------------------------------------------------------------
 
-IMAGE_NAME="code-review-agent"
-CONTAINER_DIR="$SCRIPT_DIR/container"
-
-if ! $CONTAINER_CLI image inspect "$IMAGE_NAME" &>/dev/null; then
-    if [ "$RUNTIME" = "apple-container" ]; then
-        # Apple Container buildkit has DNS issues — build via Docker and import
-        echo "Building image via Docker (Apple Container buildkit DNS workaround)..."
-        docker build -t "$IMAGE_NAME" "$CONTAINER_DIR"
-        OCI_TAR="$(mktemp -d)/${IMAGE_NAME}.tar"
-        echo "Exporting and importing into Apple Container..."
-        docker save -o "$OCI_TAR" "$IMAGE_NAME"
-        container image load -i "$OCI_TAR"
-        rm -f "$OCI_TAR"
-        echo "Image '$IMAGE_NAME' imported into Apple Container."
-    else
-        echo "Building container image ($CONTAINER_CLI): $IMAGE_NAME"
-        $CONTAINER_CLI build -t "$IMAGE_NAME" "$CONTAINER_DIR"
-    fi
-else
-    echo "Container image '$IMAGE_NAME' already exists."
-fi
+# Delegate to build.sh (handles Docker, Apple Container, and DNS workarounds)
+"$SCRIPT_DIR/container/build.sh"
 
 # --------------------------------------------------------------------------
 # Clone or update repository

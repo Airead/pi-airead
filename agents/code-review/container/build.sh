@@ -54,13 +54,15 @@ if [ "$RUNTIME" = "apple-container" ]; then
     docker build -t "$IMAGE_NAME" "$SCRIPT_DIR"
 
     echo "Exporting OCI tarball..."
-    OCI_TAR="$(mktemp -d)/${IMAGE_NAME}.tar"
+    OCI_DIR="$(mktemp -d)"
+    OCI_TAR="${OCI_DIR}/${IMAGE_NAME}.tar"
     docker save -o "$OCI_TAR" "$IMAGE_NAME"
 
     echo "Importing into Apple Container..."
     container image load -i "$OCI_TAR"
 
     rm -f "$OCI_TAR"
+    rmdir "$OCI_DIR" 2>/dev/null || true
     echo "Image '$IMAGE_NAME' imported into Apple Container successfully."
 else
     echo "Building container image ($CLI): $IMAGE_NAME"

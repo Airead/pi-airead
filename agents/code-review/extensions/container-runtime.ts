@@ -5,8 +5,8 @@
  */
 import { execFileSync } from "node:child_process";
 import { CREDENTIAL_PROXY_PORT } from "./credential-proxy.js";
-import { existsSync, readdirSync } from "node:fs";
-import { networkInterfaces, platform } from "node:os";
+import { existsSync, mkdtempSync, readdirSync, rmdirSync, unlinkSync } from "node:fs";
+import { networkInterfaces, platform, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
 // ============================================================================
@@ -15,24 +15,33 @@ import { basename, join } from "node:path";
 
 export type ContainerRuntime = "docker" | "apple-container";
 
+let _cachedRuntime: ContainerRuntime | undefined;
+
 /**
- * Return the active container runtime.
+ * Return the active container runtime (cached after first call).
  * Priority: CONTAINER_RUNTIME env var > auto-detect (macOS + `container` CLI → apple-container) > docker.
  */
 export function currentRuntime(): ContainerRuntime {
+	if (_cachedRuntime !== undefined) return _cachedRuntime;
 	const env = process.env.CONTAINER_RUNTIME;
-	if (env === "apple-container") return "apple-container";
-	if (env === "docker") return "docker";
+	if (env === "apple-container") return (_cachedRuntime = "apple-container");
+	if (env === "docker") return (_cachedRuntime = "docker");
 	// Auto-detect: prefer Apple Container on macOS when available
 	if (platform() === "darwin") {
 		try {
 			execFileSync("container", ["--version"], { stdio: "pipe", timeout: 5_000 });
-			return "apple-container";
+			return (_cachedRuntime = "apple-container");
 		} catch {
 			// Apple Container CLI not found — fall back to Docker
 		}
 	}
-	return "docker";
+	return (_cachedRuntime = "docker");
+}
+
+/** Reset all module-level caches (for testing only). */
+export function _resetCaches(): void {
+	_cachedRuntime = undefined;
+	_cachedHostDns = undefined;
 }
 
 // ============================================================================
@@ -79,11 +88,14 @@ export function runtimeBin(): string {
 	return currentRuntime() === "apple-container" ? "container" : "docker";
 }
 
+let _cachedHostDns: string | undefined;
+
 /**
- * Detect the host's primary DNS server (macOS only).
+ * Detect the host's primary DNS server (macOS only, cached after first call).
  * Falls back to 8.8.8.8 if detection fails.
  */
 export function detectHostDns(): string {
+	if (_cachedHostDns !== undefined) return _cachedHostDns;
 	if (platform() === "darwin") {
 		try {
 			const output = execFileSync("scutil", ["--dns"], {
@@ -93,10 +105,10 @@ export function detectHostDns(): string {
 			});
 			// Find first nameserver from the primary resolver
 			const match = (output as string).match(/nameserver\[\d+\]\s*:\s*(\d+\.\d+\.\d+\.\d+)/);
-			if (match) return match[1];
+			if (match) return (_cachedHostDns = match[1]);
 		} catch { /* fall through */ }
 	}
-	return "8.8.8.8";
+	return (_cachedHostDns = "8.8.8.8");
 }
 
 /** Docker image name for the code review agent. */
@@ -212,7 +224,8 @@ export function ensureImageBuilt(dockerfilePath: string): void {
 				timeout: 300_000,
 			});
 			console.log(`[container] Exporting and importing image into Apple Container...`);
-			const ociTar = join(dockerfilePath, `../${CONTAINER_IMAGE}.tar`);
+			const ociDir = mkdtempSync(join(tmpdir(), "cr-build-"));
+			const ociTar = join(ociDir, `${CONTAINER_IMAGE}.tar`);
 			try {
 				execFileSync("docker", ["save", "-o", ociTar, CONTAINER_IMAGE], {
 					stdio: "inherit",
@@ -223,7 +236,8 @@ export function ensureImageBuilt(dockerfilePath: string): void {
 					timeout: 120_000,
 				});
 			} finally {
-				try { execFileSync("rm", ["-f", ociTar], { stdio: "pipe" }); } catch { /* ignore */ }
+				try { unlinkSync(ociTar); } catch { /* ignore */ }
+				try { rmdirSync(ociDir); } catch { /* ignore */ }
 			}
 		} else {
 			console.log(`[container] Building image: ${CONTAINER_IMAGE}`);
