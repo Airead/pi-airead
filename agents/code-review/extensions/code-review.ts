@@ -986,12 +986,11 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 	): { unsubscribe: () => void; getStats: () => SubAgentStats } {
 		const stats: SubAgentStats = { toolCalls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
 
-		// Display buffer for text_delta only — flush every FLUSH_THRESHOLD chars
-		const FLUSH_THRESHOLD = 500;
+		// Unified turn buffer — all messages within a single turn are batched here
+		// and emitted as one message block at message_end (or on abort/unsubscribe).
+		const turnBuffer: string[] = [];
 		let textBuffer = "";
-
-		// Tool call message buffer — batches tool_execution_start/end into one emit per turn
-		const toolCallBuffer: string[] = [];
+		const TEXT_FLUSH_THRESHOLD = 500;
 
 		// Repetition detection — separate window for text_delta + toolcall_delta
 		const REP_CHECK_WINDOW = 200;
@@ -1000,30 +999,31 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 		let charsSinceRepCheck = 0;
 		let aborted = false;
 
-		function flushToolCallBuffer(): void {
-			if (toolCallBuffer.length > 0) {
-				emit(toolCallBuffer.join("\n"));
-				toolCallBuffer.length = 0;
+		function drainTextBuffer(): void {
+			if (textBuffer.length > 0) {
+				turnBuffer.push(`[${prefix}] ... ${truncate(textBuffer.trim(), 500)}`);
+				textBuffer = "";
 			}
 		}
 
-		function flushTextBuffer(): void {
-			if (textBuffer.length > 0) {
-				emit(`[${prefix}] ... ${truncate(textBuffer.trim(), 500)}`);
-				textBuffer = "";
+		function flushTurn(): void {
+			drainTextBuffer();
+			if (turnBuffer.length > 0) {
+				emit(turnBuffer.join("\n"));
+				turnBuffer.length = 0;
 			}
 		}
 
 		const unsubscribe = client.onEvent((event: any) => {
 			if (event.type === "tool_execution_start") {
-				flushTextBuffer();
+				drainTextBuffer();
 				stats.toolCalls++;
 				const argSummary = formatToolArgs(event.toolName, event.args);
 				let msg = `[${prefix}] → ${event.toolName} (${stats.toolCalls}/${LIMITS.maxToolCallsPerSubAgent})`;
 				if (argSummary) msg += `\n  args: ${argSummary}`;
-				toolCallBuffer.push(msg);
+				turnBuffer.push(msg);
 				if (stats.toolCalls >= LIMITS.maxToolCallsPerSubAgent) {
-					flushToolCallBuffer();
+					flushTurn();
 					emitWarn(`[${prefix}] Tool call limit reached, aborting sub-agent`);
 					client.abort().catch(() => {});
 				}
@@ -1031,16 +1031,13 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 
 			if (event.type === "tool_execution_end") {
 				const resultSummary = formatToolResult(event.toolName, event.result, event.isError);
-				toolCallBuffer.push(`[${prefix}] ← ${event.toolName}\n  result: ${resultSummary}`);
+				turnBuffer.push(`[${prefix}] ← ${event.toolName}\n  result: ${resultSummary}`);
 			}
 
 			// Stream deltas and detect repetition (skip if already aborted)
 			if (event.type === "message_update" && !aborted) {
 				const sub = event.assistantMessageEvent;
-
-				// Flush batched tool call messages when text output begins
 				if (sub?.type === "text_delta") {
-					flushToolCallBuffer();
 					textBuffer += sub.delta;
 					repetitionWindow += sub.delta;
 				} else if (sub?.type === "toolcall_delta") {
@@ -1053,9 +1050,9 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 						repetitionWindow = repetitionWindow.slice(-REP_CHECK_WINDOW);
 					}
 
-					// Flush display buffer periodically
-					if (textBuffer.length >= FLUSH_THRESHOLD) {
-						flushTextBuffer();
+					// Drain text into turn buffer periodically to cap memory
+					if (textBuffer.length >= TEXT_FLUSH_THRESHOLD) {
+						drainTextBuffer();
 					}
 
 					// Check for repetition periodically
@@ -1063,7 +1060,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 					if (charsSinceRepCheck >= REP_CHECK_INTERVAL) {
 						charsSinceRepCheck = 0;
 						if (detectRepetition(repetitionWindow)) {
-							flushTextBuffer();
+							flushTurn();
 							emitWarn(`[${prefix}] Repetition detected in output, aborting sub-agent to save tokens`);
 							aborted = true;
 							repetitionWindow = "";
@@ -1074,11 +1071,9 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 				}
 			}
 
-			// Accumulate token usage from assistant messages and show per-turn delta
+			// Accumulate token usage from assistant messages and emit the whole turn
 			// Always processed (even after abort) to preserve stats
 			if (event.type === "message_end" && event.message?.role === "assistant") {
-				flushToolCallBuffer();
-				flushTextBuffer();
 				repetitionWindow = "";
 				charsSinceRepCheck = 0;
 				if (event.message.usage) {
@@ -1093,17 +1088,18 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 					stats.cacheRead += turnCacheRead;
 					stats.cacheWrite += turnCacheWrite;
 					stats.cost += turnCost;
+					drainTextBuffer();
 					let msg = `[${prefix}] :: turn tokens\n  input: ${turnIn}  output: ${turnOut}  cache-read: ${turnCacheRead}  cache-write: ${turnCacheWrite}`;
 					if (turnCost > 0) msg += `\n  cost: $${turnCost.toFixed(4)}`;
-					emit(msg);
+					turnBuffer.push(msg);
 				}
+				flushTurn();
 			}
 		});
 
 		return {
 			unsubscribe: () => {
-				flushToolCallBuffer();
-				flushTextBuffer();
+				flushTurn();
 				unsubscribe();
 			},
 			getStats: () => stats,
