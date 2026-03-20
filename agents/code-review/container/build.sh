@@ -4,17 +4,24 @@ set -euo pipefail
 # Build the code-review-agent container image
 # Usage: ./build.sh [--force]
 #
-# Respects CONTAINER_RUNTIME env var:
-#   docker (default):    uses `docker build`
-#   apple-container:     uses `container build`
+# Respects CONTAINER_RUNTIME env var. Auto-detects on macOS if not set.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 IMAGE_NAME="code-review-agent"
-RUNTIME="${CONTAINER_RUNTIME:-docker}"
+RUNTIME="${CONTAINER_RUNTIME:-auto}"
 
 FORCE=false
 if [ "${1:-}" = "--force" ]; then
     FORCE=true
+fi
+
+# Resolve runtime
+if [ "$RUNTIME" = "auto" ]; then
+    if [ "$(uname)" = "Darwin" ] && command -v container &>/dev/null; then
+        RUNTIME="apple-container"
+    else
+        RUNTIME="docker"
+    fi
 fi
 
 # Select CLI binary

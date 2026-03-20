@@ -47,7 +47,7 @@ PROVIDER=""
 MODEL=""
 AUTO_START=false
 SKILL_SUFFIX=""
-RUNTIME="${CONTAINER_RUNTIME:-docker}"
+RUNTIME="${CONTAINER_RUNTIME:-auto}"
 
 usage() {
     cat <<EOF
@@ -133,10 +133,16 @@ if ! echo "$REPO" | grep -qE '^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$'; then
 fi
 
 # --------------------------------------------------------------------------
-# Validate runtime
+# Resolve runtime (auto-detect if not explicitly set)
 # --------------------------------------------------------------------------
 
-if [ "$RUNTIME" != "docker" ] && [ "$RUNTIME" != "apple-container" ]; then
+if [ "$RUNTIME" = "auto" ]; then
+    if [ "$(uname)" = "Darwin" ] && command -v container &>/dev/null; then
+        RUNTIME="apple-container"
+    else
+        RUNTIME="docker"
+    fi
+elif [ "$RUNTIME" != "docker" ] && [ "$RUNTIME" != "apple-container" ]; then
     echo "Error: Unknown runtime '$RUNTIME'. Supported: docker, apple-container"
     exit 1
 fi

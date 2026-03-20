@@ -47,19 +47,28 @@ afterEach(() => {
 // ============================================================================
 
 describe("currentRuntime", () => {
-	it("returns 'docker' by default", () => {
-		delete process.env.CONTAINER_RUNTIME;
+	it("returns 'docker' when CONTAINER_RUNTIME=docker", () => {
+		process.env.CONTAINER_RUNTIME = "docker";
 		expect(currentRuntime()).toBe("docker");
 	});
 
-	it("returns 'docker' for unknown values", () => {
-		process.env.CONTAINER_RUNTIME = "podman";
-		expect(currentRuntime()).toBe("docker");
-	});
-
-	it("returns 'apple-container' when CONTAINER_RUNTIME is set", () => {
+	it("returns 'apple-container' when CONTAINER_RUNTIME=apple-container", () => {
 		process.env.CONTAINER_RUNTIME = "apple-container";
 		expect(currentRuntime()).toBe("apple-container");
+	});
+
+	it("auto-detects when CONTAINER_RUNTIME is not set", () => {
+		delete process.env.CONTAINER_RUNTIME;
+		const rt = currentRuntime();
+		// On macOS with Apple Container CLI installed → apple-container
+		// Otherwise → docker
+		expect(["docker", "apple-container"]).toContain(rt);
+	});
+
+	it("falls back to auto-detect for unknown values", () => {
+		process.env.CONTAINER_RUNTIME = "podman";
+		const rt = currentRuntime();
+		expect(["docker", "apple-container"]).toContain(rt);
 	});
 });
 
@@ -69,7 +78,7 @@ describe("currentRuntime", () => {
 
 describe("runtimeBin", () => {
 	it("returns 'docker' for docker runtime", () => {
-		delete process.env.CONTAINER_RUNTIME;
+		process.env.CONTAINER_RUNTIME = "docker";
 		expect(runtimeBin()).toBe("docker");
 	});
 
@@ -108,13 +117,13 @@ describe("detectProxyBindHost", () => {
 
 describe("hostGatewayArgs", () => {
 	it("returns an array", () => {
-		delete process.env.CONTAINER_RUNTIME;
+		process.env.CONTAINER_RUNTIME = "docker";
 		const args = hostGatewayArgs();
 		expect(Array.isArray(args)).toBe(true);
 	});
 
 	it("contains --add-host on Linux or is empty on macOS (docker)", () => {
-		delete process.env.CONTAINER_RUNTIME;
+		process.env.CONTAINER_RUNTIME = "docker";
 		const args = hostGatewayArgs();
 		// On macOS (test environment), should be empty
 		// On Linux, should contain --add-host
@@ -136,7 +145,7 @@ describe("hostGatewayArgs", () => {
 
 describe("readonlyMountArgs", () => {
 	it("returns -v syntax for docker", () => {
-		delete process.env.CONTAINER_RUNTIME;
+		process.env.CONTAINER_RUNTIME = "docker";
 		const args = readonlyMountArgs("/host/path", "/container/path");
 		expect(args).toEqual(["-v", "/host/path:/container/path:ro"]);
 	});
@@ -153,7 +162,7 @@ describe("readonlyMountArgs", () => {
 
 describe("writableMountArgs", () => {
 	it("returns correct mount args for docker", () => {
-		delete process.env.CONTAINER_RUNTIME;
+		process.env.CONTAINER_RUNTIME = "docker";
 		const args = writableMountArgs("/host/path", "/container/path");
 		expect(args).toEqual(["-v", "/host/path:/container/path"]);
 	});
@@ -203,7 +212,7 @@ describe("findEnvFiles", () => {
 
 describe("buildContainerArgs (docker)", () => {
 	beforeEach(() => {
-		delete process.env.CONTAINER_RUNTIME;
+		process.env.CONTAINER_RUNTIME = "docker";
 	});
 
 	it("builds correct docker run args with anthropic proxy (default)", () => {

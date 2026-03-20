@@ -15,10 +15,23 @@ import { basename, join } from "node:path";
 
 export type ContainerRuntime = "docker" | "apple-container";
 
-/** Return the active container runtime based on CONTAINER_RUNTIME env var. */
+/**
+ * Return the active container runtime.
+ * Priority: CONTAINER_RUNTIME env var > auto-detect (macOS + `container` CLI → apple-container) > docker.
+ */
 export function currentRuntime(): ContainerRuntime {
 	const env = process.env.CONTAINER_RUNTIME;
 	if (env === "apple-container") return "apple-container";
+	if (env === "docker") return "docker";
+	// Auto-detect: prefer Apple Container on macOS when available
+	if (platform() === "darwin") {
+		try {
+			execFileSync("container", ["--version"], { stdio: "pipe", timeout: 5_000 });
+			return "apple-container";
+		} catch {
+			// Apple Container CLI not found — fall back to Docker
+		}
+	}
 	return "docker";
 }
 

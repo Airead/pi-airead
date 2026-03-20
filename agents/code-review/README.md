@@ -46,14 +46,14 @@ The agent runs in a loop:
 | `--interval <hours>` | No | Hours between review cycles (default: 1, range: 0.1–24) |
 | `--provider <name>` | No | AI provider (default: `anthropic`). Supported: `anthropic`, `zai`, `openai`, `google`, `groq`, `xai`, etc. |
 | `--model <id>` | No | Model ID for the provider (e.g., `glm-5`, `gpt-4o-mini`) |
-| `--runtime <name>` | No | Container runtime: `docker` (default) or `apple-container` |
+| `--runtime <name>` | No | Container runtime: `docker` or `apple-container`. Auto-detected if omitted (prefers Apple Container on macOS when available) |
 | `--auto-start` | No | Automatically start the review loop on launch (default: wait for `/review-start`) |
 | `--skill-suffix <str>` | No | Suffix for skill directories (e.g., `-test` for dry-run mode) |
 
 ### Examples
 
 ```bash
-# Review with Anthropic (default provider, Docker runtime)
+# Review with Anthropic (runtime auto-detected: Apple Container on macOS if available, else Docker)
 ./launch.sh --repo facebook/react --data-dir /tmp/cr-data
 
 # Review with ZAI provider using glm-5
@@ -62,8 +62,8 @@ The agent runs in a loop:
 # Auto-start with 2-hour interval
 ./launch.sh --repo myorg/myrepo --data-dir /tmp/cr-data --interval 2 --auto-start
 
-# Use Apple Container runtime (macOS)
-./launch.sh --repo myorg/myrepo --data-dir /tmp/cr-data --runtime apple-container
+# Explicitly use Docker (override auto-detection)
+./launch.sh --repo myorg/myrepo --data-dir /tmp/cr-data --runtime docker
 ```
 
 ### Interactive Commands
