@@ -232,10 +232,16 @@ When using `--runtime apple-container`:
   sudo pfctl -sn > /tmp/pf-nat-backup.txt 2>/dev/null
   sudo pfctl -sr > /tmp/pf-filter-backup.txt 2>/dev/null
 
-  # Enable IP forwarding and add NAT rule (preserves existing system rules)
+  # Enable IP forwarding
   sudo sysctl -w net.inet.ip.forwarding=1
-  (echo "nat on en0 from 192.168.64.0/24 to any -> (en0)"; cat /etc/pf.conf) | sudo pfctl -f -
+
+  # Insert NAT rule before nat-anchor line (pf requires: scrub → nat → filter order)
+  awk '/^nat-anchor/ && !done {print "nat on en0 from 192.168.64.0/24 to any -> (en0)"; done=1} {print}' \
+    /etc/pf.conf | sudo pfctl -f -
   sudo pfctl -e 2>/dev/null
+
+  # Verify NAT rule is active
+  sudo pfctl -sn | grep 192.168.64
 
   # Restore original rules when done
   sudo pfctl -f /etc/pf.conf
