@@ -26,6 +26,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO=""
 PROVIDER="${REVIEW_PROVIDER:-}"
 MODEL="${REVIEW_MODEL:-}"
+RUNTIME="${CONTAINER_RUNTIME:-}"
 
 require_arg() {
     if [ $# -lt 2 ] || [[ "$2" == --* ]]; then
@@ -44,15 +45,18 @@ Positional:
 Options:
   --provider <name>      AI provider (default: \$REVIEW_PROVIDER or anthropic)
   --model <id>           Model ID (default: \$REVIEW_MODEL or provider default)
+  --runtime <name>       Container runtime: docker (default) or apple-container
   --help                 Show this help message
 
 Environment variables:
   REVIEW_PROVIDER        Default provider (overridden by --provider)
   REVIEW_MODEL           Default model (overridden by --model)
+  CONTAINER_RUNTIME      Default runtime (overridden by --runtime)
 
 Examples:
   $0 airead/WenZi
   $0 airead/WenZi --provider zai --model glm-5
+  $0 airead/WenZi --runtime apple-container
   REVIEW_PROVIDER=zai REVIEW_MODEL=glm-5 $0 airead/WenZi
 EOF
     exit "${1:-0}"
@@ -66,6 +70,9 @@ while [ $# -gt 0 ]; do
         --model)
             require_arg "$@"
             MODEL="$2"; shift 2 ;;
+        --runtime)
+            require_arg "$@"
+            RUNTIME="$2"; shift 2 ;;
         --help|-h)
             usage 0 ;;
         --*)
@@ -96,6 +103,7 @@ echo "============================================"
 echo "  Repo:      $REPO"
 echo "  Provider:  ${PROVIDER:-anthropic}"
 echo "  Model:     ${MODEL:-<default>}"
+echo "  Runtime:   ${RUNTIME:-docker}"
 echo "  Data dir:  $DATA_DIR"
 echo "  Interval:  0.1 hours (6 minutes)"
 echo "  Skills:    review-test / verify-test"
@@ -124,6 +132,10 @@ fi
 
 if [ -n "$MODEL" ]; then
     LAUNCH_ARGS+=(--model "$MODEL")
+fi
+
+if [ -n "$RUNTIME" ]; then
+    LAUNCH_ARGS+=(--runtime "$RUNTIME")
 fi
 
 # --------------------------------------------------------------------------

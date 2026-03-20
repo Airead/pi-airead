@@ -45,6 +45,7 @@ import {
 	CONTAINER_PATHS,
 	ensureImageBuilt,
 	piCliPathInContainer,
+	runtimeBin,
 	stopContainer,
 	detectProxyBindHost,
 	type ProviderConfig,
@@ -125,7 +126,7 @@ class SubAgentClient {
 				providerConfig,
 			});
 
-			this.process = spawn("docker", dockerArgs, {
+			this.process = spawn(runtimeBin(), dockerArgs, {
 				stdio: ["pipe", "pipe", "pipe"],
 			});
 		} else {

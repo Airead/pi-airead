@@ -7,6 +7,7 @@ import {
 	buildContainerArgs,
 	CONTAINER_HOST_GATEWAY,
 	CONTAINER_IMAGE,
+	currentRuntime,
 	detectProxyBindHost,
 	findEnvFiles,
 	hostGatewayArgs,
@@ -14,6 +15,7 @@ import {
 	PROVIDER_API_KEY_ENV,
 	readonlyMountArgs,
 	resolveApiKeyEnvVar,
+	runtimeBin,
 	writableMountArgs,
 } from "./container-runtime.js";
 
@@ -22,14 +24,59 @@ import {
 // ============================================================================
 
 let testDir: string;
+let originalRuntime: string | undefined;
 
 beforeEach(() => {
 	testDir = mkdtempSync(join(tmpdir(), "container-runtime-test-"));
+	originalRuntime = process.env.CONTAINER_RUNTIME;
 });
 
 afterEach(() => {
 	rmSync(testDir, { recursive: true, force: true });
+	// Restore original env
+	if (originalRuntime === undefined) {
+		delete process.env.CONTAINER_RUNTIME;
+	} else {
+		process.env.CONTAINER_RUNTIME = originalRuntime;
+	}
 	vi.restoreAllMocks();
+});
+
+// ============================================================================
+// currentRuntime
+// ============================================================================
+
+describe("currentRuntime", () => {
+	it("returns 'docker' by default", () => {
+		delete process.env.CONTAINER_RUNTIME;
+		expect(currentRuntime()).toBe("docker");
+	});
+
+	it("returns 'docker' for unknown values", () => {
+		process.env.CONTAINER_RUNTIME = "podman";
+		expect(currentRuntime()).toBe("docker");
+	});
+
+	it("returns 'apple-container' when CONTAINER_RUNTIME is set", () => {
+		process.env.CONTAINER_RUNTIME = "apple-container";
+		expect(currentRuntime()).toBe("apple-container");
+	});
+});
+
+// ============================================================================
+// runtimeBin
+// ============================================================================
+
+describe("runtimeBin", () => {
+	it("returns 'docker' for docker runtime", () => {
+		delete process.env.CONTAINER_RUNTIME;
+		expect(runtimeBin()).toBe("docker");
+	});
+
+	it("returns 'container' for apple-container runtime", () => {
+		process.env.CONTAINER_RUNTIME = "apple-container";
+		expect(runtimeBin()).toBe("container");
+	});
 });
 
 // ============================================================================
@@ -61,17 +108,25 @@ describe("detectProxyBindHost", () => {
 
 describe("hostGatewayArgs", () => {
 	it("returns an array", () => {
+		delete process.env.CONTAINER_RUNTIME;
 		const args = hostGatewayArgs();
 		expect(Array.isArray(args)).toBe(true);
 	});
 
-	it("contains --add-host on Linux or is empty on macOS", () => {
+	it("contains --add-host on Linux or is empty on macOS (docker)", () => {
+		delete process.env.CONTAINER_RUNTIME;
 		const args = hostGatewayArgs();
 		// On macOS (test environment), should be empty
 		// On Linux, should contain --add-host
 		for (const arg of args) {
 			expect(arg).toContain("host.docker.internal");
 		}
+	});
+
+	it("returns empty array for apple-container (no host gateway args needed)", () => {
+		process.env.CONTAINER_RUNTIME = "apple-container";
+		const args = hostGatewayArgs();
+		expect(args).toEqual([]);
 	});
 });
 
@@ -80,14 +135,31 @@ describe("hostGatewayArgs", () => {
 // ============================================================================
 
 describe("readonlyMountArgs", () => {
-	it("returns correct mount args", () => {
+	it("returns -v syntax for docker", () => {
+		delete process.env.CONTAINER_RUNTIME;
 		const args = readonlyMountArgs("/host/path", "/container/path");
 		expect(args).toEqual(["-v", "/host/path:/container/path:ro"]);
+	});
+
+	it("returns --mount syntax for apple-container", () => {
+		process.env.CONTAINER_RUNTIME = "apple-container";
+		const args = readonlyMountArgs("/host/path", "/container/path");
+		expect(args).toEqual([
+			"--mount",
+			"type=bind,source=/host/path,target=/container/path,readonly",
+		]);
 	});
 });
 
 describe("writableMountArgs", () => {
-	it("returns correct mount args", () => {
+	it("returns correct mount args for docker", () => {
+		delete process.env.CONTAINER_RUNTIME;
+		const args = writableMountArgs("/host/path", "/container/path");
+		expect(args).toEqual(["-v", "/host/path:/container/path"]);
+	});
+
+	it("returns correct mount args for apple-container", () => {
+		process.env.CONTAINER_RUNTIME = "apple-container";
 		const args = writableMountArgs("/host/path", "/container/path");
 		expect(args).toEqual(["-v", "/host/path:/container/path"]);
 	});
@@ -126,10 +198,14 @@ describe("findEnvFiles", () => {
 });
 
 // ============================================================================
-// buildContainerArgs
+// buildContainerArgs — Docker
 // ============================================================================
 
-describe("buildContainerArgs", () => {
+describe("buildContainerArgs (docker)", () => {
+	beforeEach(() => {
+		delete process.env.CONTAINER_RUNTIME;
+	});
+
 	it("builds correct docker run args with anthropic proxy (default)", () => {
 		const skillDir = join(testDir, "review");
 		mkdirSync(skillDir, { recursive: true });
@@ -151,6 +227,11 @@ describe("buildContainerArgs", () => {
 		expect(args).toContain("--cpus=2");
 		expect(args).toContain("--pids-limit=256");
 		expect(args).toContain(CONTAINER_IMAGE);
+
+		// Docker should set explicit user
+		const userIdx = args.indexOf("--user");
+		expect(userIdx).toBeGreaterThan(-1);
+		expect(args[userIdx + 1]).toBe("1000:1000");
 
 		// Check repo is mounted read-only
 		const repoMountIdx = args.findIndex((a) => a.includes("/host/repo:/workspace/repo:ro"));
@@ -244,6 +325,100 @@ describe("buildContainerArgs", () => {
 		expect(skillMounts.length).toBe(2);
 		expect(skillMounts.some((a) => a.includes("/workspace/skills/review:ro"))).toBe(true);
 		expect(skillMounts.some((a) => a.includes("/workspace/skills/verify:ro"))).toBe(true);
+	});
+
+	it("does not include NODE_OPTIONS for docker", () => {
+		const args = buildContainerArgs({
+			containerName: "test",
+			repoDir: "/host/repo",
+			stateDir: "/host/state",
+			skillDirs: [],
+			piCommand: ["echo"],
+		});
+
+		expect(args.find((a) => a.includes("NODE_OPTIONS"))).toBeUndefined();
+	});
+});
+
+// ============================================================================
+// buildContainerArgs — Apple Container
+// ============================================================================
+
+describe("buildContainerArgs (apple-container)", () => {
+	beforeEach(() => {
+		process.env.CONTAINER_RUNTIME = "apple-container";
+	});
+
+	it("omits --pids-limit for apple-container", () => {
+		const args = buildContainerArgs({
+			containerName: "test",
+			repoDir: "/host/repo",
+			stateDir: "/host/state",
+			skillDirs: [],
+			piCommand: ["echo"],
+		});
+
+		expect(args.find((a) => a.includes("pids-limit"))).toBeUndefined();
+		// But should still have memory and cpu limits
+		expect(args).toContain("--memory=2g");
+		expect(args).toContain("--cpus=2");
+	});
+
+	it("does not set --user (runs as root for entrypoint .env shadowing)", () => {
+		const args = buildContainerArgs({
+			containerName: "test",
+			repoDir: "/host/repo",
+			stateDir: "/host/state",
+			skillDirs: [],
+			piCommand: ["echo"],
+		});
+
+		expect(args).not.toContain("--user");
+	});
+
+	it("does not shadow .env files via mount (entrypoint handles it)", () => {
+		const repoDir = join(testDir, "repo");
+		mkdirSync(repoDir);
+		writeFileSync(join(repoDir, ".env"), "SECRET=leaked");
+
+		const args = buildContainerArgs({
+			containerName: "test",
+			repoDir,
+			stateDir: "/host/state",
+			skillDirs: [],
+			piCommand: ["echo"],
+		});
+
+		const devNullMounts = args.filter((a) => a.includes("/dev/null"));
+		expect(devNullMounts.length).toBe(0);
+	});
+
+	it("includes NODE_OPTIONS for IPv4 DNS preference", () => {
+		const args = buildContainerArgs({
+			containerName: "test",
+			repoDir: "/host/repo",
+			stateDir: "/host/state",
+			skillDirs: [],
+			piCommand: ["echo"],
+		});
+
+		expect(args).toContain("NODE_OPTIONS=--dns-result-order=ipv4first");
+	});
+
+	it("uses --mount syntax for readonly mounts", () => {
+		const args = buildContainerArgs({
+			containerName: "test",
+			repoDir: "/host/repo",
+			stateDir: "/host/state",
+			skillDirs: [],
+			piCommand: ["echo"],
+		});
+
+		// Repo mount should use --mount syntax
+		const mountIdx = args.findIndex((a) =>
+			a.includes("type=bind,source=/host/repo,target=/workspace/repo,readonly"),
+		);
+		expect(mountIdx).toBeGreaterThan(-1);
 	});
 });
 

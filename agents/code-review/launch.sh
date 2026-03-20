@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Code Review Agent Launcher
-# Usage: ./launch.sh --repo <owner/repo> --data-dir <path> [--interval <hours>] [--provider <name>] [--model <id>]
+# Usage: ./launch.sh --repo <owner/repo> --data-dir <path> [--interval <hours>] [--provider <name>] [--model <id>] [--runtime <docker|apple-container>]
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -47,6 +47,7 @@ PROVIDER=""
 MODEL=""
 AUTO_START=false
 SKILL_SUFFIX=""
+RUNTIME="${CONTAINER_RUNTIME:-docker}"
 
 usage() {
     cat <<EOF
@@ -60,6 +61,7 @@ Optional:
   --interval <hours>     Hours between review cycles (default: 1)
   --provider <name>      AI provider (default: anthropic). e.g., zai, openai, google
   --model <id>           Model ID. e.g., glm-5, gpt-5.4
+  --runtime <name>       Container runtime: docker (default) or apple-container
   --auto-start           Automatically start review loop (default: wait for /review-start)
   --skill-suffix <str>   Suffix for skill dirs (e.g., "-test" for e2e dry-run mode)
   --help                 Show this help message
@@ -93,6 +95,9 @@ while [ $# -gt 0 ]; do
             MODEL="$2"; shift 2 ;;
         --auto-start)
             AUTO_START=true; shift ;;
+        --runtime)
+            require_arg "$@"
+            RUNTIME="$2"; shift 2 ;;
         --skill-suffix)
             require_arg "$@"
             SKILL_SUFFIX="$2"; shift 2 ;;
@@ -128,6 +133,24 @@ if ! echo "$REPO" | grep -qE '^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$'; then
 fi
 
 # --------------------------------------------------------------------------
+# Validate runtime
+# --------------------------------------------------------------------------
+
+if [ "$RUNTIME" != "docker" ] && [ "$RUNTIME" != "apple-container" ]; then
+    echo "Error: Unknown runtime '$RUNTIME'. Supported: docker, apple-container"
+    exit 1
+fi
+
+export CONTAINER_RUNTIME="$RUNTIME"
+
+# Select CLI binary
+if [ "$RUNTIME" = "apple-container" ]; then
+    CONTAINER_CLI="container"
+else
+    CONTAINER_CLI="docker"
+fi
+
+# --------------------------------------------------------------------------
 # Check prerequisites
 # --------------------------------------------------------------------------
 
@@ -148,14 +171,25 @@ if ! gh auth status &>/dev/null; then
     exit 1
 fi
 
-if ! command -v docker &>/dev/null; then
-    echo "Error: 'docker' command not found. Docker is required for container isolation."
+if ! command -v "$CONTAINER_CLI" &>/dev/null; then
+    if [ "$RUNTIME" = "apple-container" ]; then
+        echo "Error: 'container' command not found. Install Apple Container: https://github.com/apple/container"
+    else
+        echo "Error: 'docker' command not found. Docker is required for container isolation."
+    fi
     exit 1
 fi
 
-if ! docker info &>/dev/null 2>&1; then
-    echo "Error: Docker is not running. Please start Docker first."
-    exit 1
+if [ "$RUNTIME" = "apple-container" ]; then
+    if ! $CONTAINER_CLI system status &>/dev/null 2>&1; then
+        echo "Error: Apple Container is not running. Try: container system start"
+        exit 1
+    fi
+else
+    if ! $CONTAINER_CLI info &>/dev/null 2>&1; then
+        echo "Error: Docker is not running. Please start Docker first."
+        exit 1
+    fi
 fi
 
 # Check API key for the specified provider
@@ -183,17 +217,17 @@ MAX_REPO_SIZE_MB=500
 mkdir -p "$STATE_DIR"
 
 # --------------------------------------------------------------------------
-# Ensure Docker image is built
+# Ensure container image is built
 # --------------------------------------------------------------------------
 
 IMAGE_NAME="code-review-agent"
 CONTAINER_DIR="$SCRIPT_DIR/container"
 
-if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
-    echo "Building Docker image: $IMAGE_NAME"
-    docker build -t "$IMAGE_NAME" "$CONTAINER_DIR"
+if ! $CONTAINER_CLI image inspect "$IMAGE_NAME" &>/dev/null; then
+    echo "Building container image ($CONTAINER_CLI): $IMAGE_NAME"
+    $CONTAINER_CLI build -t "$IMAGE_NAME" "$CONTAINER_DIR"
 else
-    echo "Docker image '$IMAGE_NAME' already exists."
+    echo "Container image '$IMAGE_NAME' already exists."
 fi
 
 # --------------------------------------------------------------------------
@@ -236,6 +270,7 @@ echo "Starting code review agent..."
 echo "  Repository:  $REPO"
 echo "  Provider:    $PROVIDER"
 echo "  Model:       ${MODEL:-<default>}"
+echo "  Runtime:     $RUNTIME"
 echo "  Data dir:    $DATA_DIR"
 echo "  Interval:    ${INTERVAL} hour(s)"
 echo ""

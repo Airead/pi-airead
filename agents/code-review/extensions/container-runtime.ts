@@ -1,12 +1,26 @@
 /**
  * Container runtime abstraction for code-review agent.
- * All Docker-specific logic lives here.
+ * Supports Docker and Apple Container runtimes.
+ * All runtime-specific logic lives here so the rest of the codebase is runtime-agnostic.
  */
 import { execFileSync } from "node:child_process";
 import { CREDENTIAL_PROXY_PORT } from "./credential-proxy.js";
 import { existsSync, readdirSync } from "node:fs";
 import { networkInterfaces, platform } from "node:os";
 import { basename, join } from "node:path";
+
+// ============================================================================
+// Runtime Detection
+// ============================================================================
+
+export type ContainerRuntime = "docker" | "apple-container";
+
+/** Return the active container runtime based on CONTAINER_RUNTIME env var. */
+export function currentRuntime(): ContainerRuntime {
+	const env = process.env.CONTAINER_RUNTIME;
+	if (env === "apple-container") return "apple-container";
+	return "docker";
+}
 
 // ============================================================================
 // Provider Configuration
@@ -47,13 +61,15 @@ export function resolveApiKeyEnvVar(provider: string): string {
 	return PROVIDER_API_KEY_ENV[provider] ?? `${provider.toUpperCase().replace(/-/g, "_")}_API_KEY`;
 }
 
-/** The container runtime binary name. */
-export const CONTAINER_RUNTIME_BIN = "docker";
+/** The container runtime binary name (derived from active runtime). */
+export function runtimeBin(): string {
+	return currentRuntime() === "apple-container" ? "container" : "docker";
+}
 
 /** Docker image name for the code review agent. */
 export const CONTAINER_IMAGE = "code-review-agent";
 
-/** Hostname containers use to reach the host machine. */
+/** Hostname containers use to reach the host machine (same for both runtimes on macOS). */
 export const CONTAINER_HOST_GATEWAY = "host.docker.internal";
 
 /** Container resource limits. */
@@ -76,7 +92,8 @@ export const CONTAINER_PATHS = {
 
 /**
  * Address the credential proxy binds to.
- * macOS/WSL: 127.0.0.1 (Docker Desktop VM routes host.docker.internal to loopback)
+ * macOS (Docker Desktop or Apple Container): 127.0.0.1
+ * WSL (Docker Desktop): 127.0.0.1
  * Linux: docker0 bridge IP, falling back to 0.0.0.0
  */
 export function detectProxyBindHost(): string {
@@ -97,14 +114,23 @@ export function detectProxyBindHost(): string {
 
 /** CLI args needed for the container to resolve the host gateway on Linux. */
 export function hostGatewayArgs(): string[] {
+	// Apple Container on macOS resolves host.docker.internal natively — no extra args needed.
+	if (currentRuntime() === "apple-container") return [];
 	if (platform() === "linux") {
 		return ["--add-host=host.docker.internal:host-gateway"];
 	}
 	return [];
 }
 
-/** Returns CLI args for a readonly bind mount. */
+/**
+ * Returns CLI args for a readonly bind mount.
+ * Apple Container (VirtioFS) does not support file-level bind mounts,
+ * so we use --mount syntax for directory mounts and skip file mounts.
+ */
 export function readonlyMountArgs(hostPath: string, containerPath: string): string[] {
+	if (currentRuntime() === "apple-container") {
+		return ["--mount", `type=bind,source=${hostPath},target=${containerPath},readonly`];
+	}
 	return ["-v", `${hostPath}:${containerPath}:ro`];
 }
 
@@ -115,28 +141,33 @@ export function writableMountArgs(hostPath: string, containerPath: string): stri
 
 /** Ensure the container runtime is running. Throws with helpful message if not. */
 export function ensureRuntimeRunning(): void {
+	const bin = runtimeBin();
+	const rt = currentRuntime();
 	try {
-		execFileSync(CONTAINER_RUNTIME_BIN, ["info"], {
-			stdio: "pipe",
-			timeout: 10_000,
-		});
+		if (rt === "apple-container") {
+			execFileSync(bin, ["system", "status"], { stdio: "pipe", timeout: 10_000 });
+		} else {
+			execFileSync(bin, ["info"], { stdio: "pipe", timeout: 10_000 });
+		}
 	} catch {
+		const name = rt === "apple-container" ? "Apple Container" : "Docker";
 		throw new Error(
-			"Docker is required but not running. Please install and start Docker, then retry.",
+			`${name} is required but not running. Please install and start ${name}, then retry.`,
 		);
 	}
 }
 
 /** Ensure the container image exists, building it if needed. */
 export function ensureImageBuilt(dockerfilePath: string): void {
+	const bin = runtimeBin();
 	try {
-		execFileSync(CONTAINER_RUNTIME_BIN, ["image", "inspect", CONTAINER_IMAGE], {
+		execFileSync(bin, ["image", "inspect", CONTAINER_IMAGE], {
 			stdio: "pipe",
 			timeout: 10_000,
 		});
 	} catch {
 		console.log(`[container] Building image: ${CONTAINER_IMAGE}`);
-		execFileSync(CONTAINER_RUNTIME_BIN, ["build", "-t", CONTAINER_IMAGE, dockerfilePath], {
+		execFileSync(bin, ["build", "-t", CONTAINER_IMAGE, dockerfilePath], {
 			stdio: "inherit",
 			timeout: 300_000,
 		});
@@ -145,13 +176,27 @@ export function ensureImageBuilt(dockerfilePath: string): void {
 
 /** Kill orphaned code-review containers from previous runs. */
 export function cleanupOrphans(prefix: string = "code-review-"): void {
+	const bin = runtimeBin();
 	try {
-		const output = execFileSync(
-			CONTAINER_RUNTIME_BIN,
-			["ps", "--filter", `name=${prefix}`, "--format", "{{.Names}}"],
-			{ stdio: ["pipe", "pipe", "pipe"], encoding: "utf-8" },
-		);
-		const orphans = (output as string).trim().split("\n").filter(Boolean);
+		let orphans: string[];
+		if (currentRuntime() === "apple-container") {
+			// Apple Container: `container ls --format json` returns JSON array
+			const output = execFileSync(bin, ["ls", "--format", "json"], {
+				stdio: ["pipe", "pipe", "pipe"],
+				encoding: "utf-8",
+			});
+			const containers: Array<{ name?: string; names?: string }> = JSON.parse(output || "[]");
+			orphans = containers
+				.map((c) => c.name || c.names || "")
+				.filter((n) => n.startsWith(prefix));
+		} else {
+			const output = execFileSync(
+				bin,
+				["ps", "--filter", `name=${prefix}`, "--format", "{{.Names}}"],
+				{ stdio: ["pipe", "pipe", "pipe"], encoding: "utf-8" },
+			);
+			orphans = (output as string).trim().split("\n").filter(Boolean);
+		}
 		for (const name of orphans) {
 			stopContainer(name);
 		}
@@ -159,7 +204,7 @@ export function cleanupOrphans(prefix: string = "code-review-"): void {
 			console.log(`[container] Stopped ${orphans.length} orphaned container(s)`);
 		}
 	} catch {
-		// Failed to list — Docker may not be running yet
+		// Failed to list — runtime may not be running yet
 	}
 }
 
@@ -178,7 +223,7 @@ export function findEnvFiles(dir: string): string[] {
 }
 
 /**
- * Build docker run args for a container-isolated sub-agent.
+ * Build container run args for a container-isolated sub-agent.
  *
  * For anthropic provider: uses credential proxy (container gets placeholder key + proxy URL).
  * For other providers: passes real API key via --api-key in piCommand (container accesses provider directly).
@@ -195,6 +240,7 @@ export function buildContainerArgs(options: {
 	const { containerName, repoDir, stateDir, sessionsDir, skillDirs, piCommand, providerConfig } = options;
 	const gateway = CONTAINER_HOST_GATEWAY;
 	const isAnthropicProxy = !providerConfig || providerConfig.provider === "anthropic";
+	const rt = currentRuntime();
 
 	const args: string[] = [
 		"run",
@@ -205,7 +251,20 @@ export function buildContainerArgs(options: {
 		// Resource limits
 		`--memory=${CONTAINER_RESOURCE_LIMITS.memory}`,
 		`--cpus=${CONTAINER_RESOURCE_LIMITS.cpus}`,
-		`--pids-limit=${CONTAINER_RESOURCE_LIMITS.pidsLimit}`,
+	];
+
+	// Apple Container does not support --pids-limit
+	if (rt !== "apple-container") {
+		args.push(`--pids-limit=${CONTAINER_RESOURCE_LIMITS.pidsLimit}`);
+	}
+
+	// Docker: run as node user (Dockerfile no longer sets USER).
+	// Apple Container: run as root so entrypoint can shadow .env via mount --bind.
+	if (rt !== "apple-container") {
+		args.push("--user", "1000:1000");
+	}
+
+	args.push(
 		// Read-only repo
 		...readonlyMountArgs(repoDir, CONTAINER_PATHS.repo),
 		// Writable state
@@ -214,7 +273,7 @@ export function buildContainerArgs(options: {
 		...skillDirs.flatMap((s) => readonlyMountArgs(s, CONTAINER_PATHS.skill(basename(s)))),
 		// Writable pi home (persists sessions to host)
 		...(sessionsDir ? writableMountArgs(sessionsDir, CONTAINER_PATHS.piHome) : []),
-	];
+	);
 
 	if (isAnthropicProxy) {
 		// Anthropic: route through credential proxy (no real keys in container)
@@ -224,15 +283,27 @@ export function buildContainerArgs(options: {
 	// Non-anthropic: real API key is passed via --api-key in piCommand (not env vars).
 	// Container needs internet access to reach the provider API directly.
 
+	// Disable git hooks
+	args.push("-e", "GIT_CONFIG_NOSYSTEM=1");
+
+	// Apple Container NAT is IPv4 only — force Node.js to prefer IPv4 DNS results.
+	if (rt === "apple-container") {
+		args.push("-e", "NODE_OPTIONS=--dns-result-order=ipv4first");
+	}
+
+	// Shadow .env files to prevent credential leakage.
+	// Docker: use file-level bind mount from /dev/null (VirtioFS supports this).
+	// Apple Container: skip here — entrypoint.sh handles it via mount --bind.
+	if (rt !== "apple-container") {
+		args.push(
+			...findEnvFiles(repoDir).flatMap((f) => [
+				"--mount",
+				`type=bind,source=/dev/null,target=${CONTAINER_PATHS.repo}/${f},readonly`,
+			]),
+		);
+	}
+
 	args.push(
-		// Disable git hooks
-		"-e",
-		"GIT_CONFIG_NOSYSTEM=1",
-		// Shadow .env files
-		...findEnvFiles(repoDir).flatMap((f) => [
-			"--mount",
-			`type=bind,source=/dev/null,target=${CONTAINER_PATHS.repo}/${f},readonly`,
-		]),
 		// Platform-specific host gateway
 		...hostGatewayArgs(),
 		// Image
@@ -257,8 +328,14 @@ export function piCliPathInContainer(): string {
  * Stop a container by name with a grace period.
  */
 export function stopContainer(name: string, timeoutSec: number = 3): void {
+	const args = ["stop"];
+	// Apple Container `container stop` does not support -t flag
+	if (currentRuntime() !== "apple-container") {
+		args.push("-t", String(timeoutSec));
+	}
+	args.push(name);
 	try {
-		execFileSync(CONTAINER_RUNTIME_BIN, ["stop", "-t", String(timeoutSec), name], {
+		execFileSync(runtimeBin(), args, {
 			stdio: "pipe",
 			timeout: (timeoutSec + 5) * 1000,
 		});
