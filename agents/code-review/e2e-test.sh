@@ -9,21 +9,23 @@ set -euo pipefail
 #   - Full scheduling, Docker, RPC, monitoring pipeline is exercised
 #
 # Usage:
-#   ./e2e-test.sh --repo <owner/repo> [--provider <name>] [--model <id>]
+#   ./e2e-test.sh <owner/repo> [--provider <name>] [--model <id>]
+#   ./e2e-test.sh <owner/repo>                          # uses REVIEW_PROVIDER / REVIEW_MODEL env vars
 #
-# Example:
-#   ./e2e-test.sh --repo Airead/pi-airead
-#   ./e2e-test.sh --repo Airead/pi-airead --provider openai --model gpt-4o-mini
+# Examples:
+#   ./e2e-test.sh airead/WenZi
+#   ./e2e-test.sh airead/WenZi --provider zai --model glm-5
+#   REVIEW_PROVIDER=zai REVIEW_MODEL=glm-5 ./e2e-test.sh airead/WenZi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # --------------------------------------------------------------------------
-# Parse arguments (only repo, provider, model — rest is hardcoded for testing)
+# Parse arguments
 # --------------------------------------------------------------------------
 
 REPO=""
-PROVIDER=""
-MODEL=""
+PROVIDER="${REVIEW_PROVIDER:-}"
+MODEL="${REVIEW_MODEL:-}"
 
 require_arg() {
     if [ $# -lt 2 ] || [[ "$2" == --* ]]; then
@@ -32,11 +34,32 @@ require_arg() {
     fi
 }
 
+usage() {
+    cat <<EOF
+Usage: $0 <owner/repo> [options]
+
+Positional:
+  <owner/repo>           GitHub repository to test against
+
+Options:
+  --provider <name>      AI provider (default: \$REVIEW_PROVIDER or anthropic)
+  --model <id>           Model ID (default: \$REVIEW_MODEL or provider default)
+  --help                 Show this help message
+
+Environment variables:
+  REVIEW_PROVIDER        Default provider (overridden by --provider)
+  REVIEW_MODEL           Default model (overridden by --model)
+
+Examples:
+  $0 airead/WenZi
+  $0 airead/WenZi --provider zai --model glm-5
+  REVIEW_PROVIDER=zai REVIEW_MODEL=glm-5 $0 airead/WenZi
+EOF
+    exit "${1:-0}"
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
-        --repo)
-            require_arg "$@"
-            REPO="$2"; shift 2 ;;
         --provider)
             require_arg "$@"
             PROVIDER="$2"; shift 2 ;;
@@ -44,16 +67,22 @@ while [ $# -gt 0 ]; do
             require_arg "$@"
             MODEL="$2"; shift 2 ;;
         --help|-h)
-            echo "Usage: $0 --repo <owner/repo> [--provider <name>] [--model <id>]"
-            exit 0 ;;
+            usage 0 ;;
+        --*)
+            echo "Error: Unknown option: $1"; usage 1 ;;
         *)
-            echo "Error: Unknown argument: $1"; exit 1 ;;
+            if [ -z "$REPO" ]; then
+                REPO="$1"; shift
+            else
+                echo "Error: Unexpected argument: $1"; usage 1
+            fi ;;
     esac
 done
 
 if [ -z "$REPO" ]; then
-    echo "Error: --repo is required"
-    exit 1
+    echo "Error: repository argument is required"
+    echo ""
+    usage 1
 fi
 
 # --------------------------------------------------------------------------

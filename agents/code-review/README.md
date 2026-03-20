@@ -27,12 +27,12 @@ The agent runs in a loop:
 - [pi-coding-agent](https://github.com/nicobrinkkemper/pi-mono) installed and in PATH
 - [GitHub CLI](https://cli.github.com/) (`gh`) installed and authenticated
 - [Docker](https://www.docker.com/) installed and running
-- `ANTHROPIC_API_KEY` environment variable set (used by the credential proxy)
+- An API key for your chosen provider (e.g., `ANTHROPIC_API_KEY`, `ZAI_API_KEY`, `OPENAI_API_KEY`)
 
 ## Usage
 
 ```bash
-./launch.sh --repo <owner/repo> --data-dir <path> [--interval <hours>]
+./launch.sh --repo <owner/repo> --data-dir <path> [options]
 ```
 
 ### Parameters
@@ -40,17 +40,24 @@ The agent runs in a loop:
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `--repo <owner/repo>` | Yes | GitHub repository to review |
-| `--data-dir <path>` | Yes | Directory for runtime data (state/ and workspace/). Relative paths are auto-resolved to absolute. |
+| `--data-dir <path>` | Yes | Directory for runtime data (state/ and workspace/) |
 | `--interval <hours>` | No | Hours between review cycles (default: 1, range: 0.1–24) |
+| `--provider <name>` | No | AI provider (default: `anthropic`). Supported: `anthropic`, `zai`, `openai`, `google`, `groq`, `xai`, etc. |
+| `--model <id>` | No | Model ID for the provider (e.g., `glm-5`, `gpt-4o-mini`) |
+| `--auto-start` | No | Automatically start the review loop on launch (default: wait for `/review-start`) |
+| `--skill-suffix <str>` | No | Suffix for skill directories (e.g., `-test` for dry-run mode) |
 
 ### Examples
 
 ```bash
-# Review facebook/react every hour, storing data in /tmp/cr-data
+# Review with Anthropic (default provider)
 ./launch.sh --repo facebook/react --data-dir /tmp/cr-data
 
-# Review a repo every 2 hours
-./launch.sh --repo myorg/myrepo --data-dir ~/.code-review-data --interval 2
+# Review with ZAI provider using glm-5
+./launch.sh --repo myorg/myrepo --data-dir ~/.code-review-data --provider zai --model glm-5
+
+# Auto-start with 2-hour interval
+./launch.sh --repo myorg/myrepo --data-dir /tmp/cr-data --interval 2 --auto-start
 ```
 
 ### Interactive Commands
@@ -59,11 +66,60 @@ Once the agent is running, you can use these commands in the pi terminal:
 
 | Command | Description |
 |---------|-------------|
-| `/review-start` | Start the review loop (auto-started on launch) |
+| `/review-start` | Start the review loop |
 | `/review-stop` | Stop the review loop |
 | `/review-now` | Trigger an immediate review cycle |
 | `/review-status` | Show review progress and stats |
 | `/review-reset` | Reset the reviewed files list |
+
+## E2E Testing
+
+The e2e test script runs the full scheduling pipeline (Docker, RPC, monitoring, state management) without performing real code reviews or creating GitHub issues.
+
+It uses dry-run skill files: `review-test` writes empty findings, `verify-test` always rejects — so **no GitHub issues are ever created**.
+
+### Quick Start
+
+```bash
+# Simplest form — repo as positional argument
+./e2e-test.sh airead/WenZi
+
+# With provider/model flags
+./e2e-test.sh airead/WenZi --provider zai --model glm-5
+
+# Or set env vars once, then just pass repo
+export REVIEW_PROVIDER=zai REVIEW_MODEL=glm-5
+./e2e-test.sh airead/WenZi
+```
+
+### What It Does
+
+1. Creates a temporary data directory
+2. Launches the agent with `--interval 0.1` (6-minute cycles), `--auto-start`, and `--skill-suffix "-test"`
+3. Sub-agents run in real Docker containers but do minimal work (1–2 API calls per round)
+4. On exit (`Ctrl+C`), prints a summary: cycle state, reviewed file count, findings cache size, and checks for accidentally created issues
+
+### What to Observe
+
+- **Scheduling**: Log messages like `"Next review in 0.1 hour(s)"` confirm the timer is firing
+- **File selection**: Each cycle prints `"Reviewing: <file>"` — files should rotate
+- **Findings flow**: Should see `"No findings to verify"` (review-test returns empty findings)
+- **Commands**: Use `/review-status`, `/review-stop`, `/review-start` interactively
+
+### Testing Failure Scenarios
+
+Manually manipulate state files to simulate edge cases:
+
+```bash
+# Find the state directory (printed in the e2e test banner)
+STATE_DIR=/tmp/.../code-review-e2e/airead_WenZi/state
+
+# Simulate a crash mid-review (tests crash recovery)
+echo '{"status":"reviewing","file":"src/main.ts","repo":"airead/WenZi"}' > "$STATE_DIR/cycle.json"
+
+# Simulate near daily limit (tests safety gate)
+echo '{"date":"2026-03-20","cycleCount":19}' > "$STATE_DIR/daily-stats.json"
+```
 
 ## Directory Structure
 
@@ -79,6 +135,8 @@ agents/code-review/               # Project directory (checked into git)
 │   ├── code-review.ts             # Main extension: scheduling, RPC, state
 │   ├── code-review-utils.ts       # Pure utility functions + host-side GitHub ops
 │   ├── code-review-utils.test.ts  # Tests for utils
+│   ├── code-review-scheduler.ts   # Pure scheduling decision functions
+│   ├── code-review-scheduler.test.ts # Tests for scheduler
 │   ├── container-runtime.ts       # Docker runtime abstraction (mounts, env, resource limits)
 │   ├── container-runtime.test.ts  # Tests for container runtime
 │   ├── credential-proxy.ts        # HTTP proxy that injects API key for containers
@@ -86,9 +144,14 @@ agents/code-review/               # Project directory (checked into git)
 ├── skills/
 │   ├── review/
 │   │   └── SKILL.md               # Round 1: code review instructions
-│   └── verify/
-│       └── SKILL.md               # Round 2: verification only (no GitHub ops)
+│   ├── verify/
+│   │   └── SKILL.md               # Round 2: verification only (no GitHub ops)
+│   ├── review-test/
+│   │   └── SKILL.md               # Dry-run review (writes empty findings)
+│   └── verify-test/
+│       └── SKILL.md               # Dry-run verify (always rejects)
 ├── launch.sh                      # Entry point (checks Docker, builds image, clones repo)
+├── e2e-test.sh                    # E2E test launcher (dry-run mode)
 └── README.md
 
 <data-dir>/                        # External runtime directory (user-specified)
