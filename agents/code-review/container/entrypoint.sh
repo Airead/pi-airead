@@ -20,6 +20,7 @@ if [ "$(id -u)" = "0" ]; then
     done
 
     # Drop privileges to node user (uid 1000)
+    export HOME=/home/node
     exec setpriv --reuid=1000 --regid=1000 --clear-groups -- "$@"
 fi
 
