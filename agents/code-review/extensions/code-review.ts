@@ -33,6 +33,13 @@ import {
 	validateRepo,
 } from "./code-review-utils.js";
 import {
+	calculateBackoffInterval,
+	decideCycleRecovery,
+	decideLoopAction,
+	decidePostCycle,
+	shouldIncrementDailyStats,
+} from "./code-review-scheduler.js";
+import {
 	buildContainerArgs,
 	cleanupOrphans,
 	CONTAINER_PATHS,
@@ -458,6 +465,10 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 		description: "Automatically start review loop on session start",
 		type: "boolean",
 	});
+	pi.registerFlag("review-skill-suffix", {
+		description: "Suffix for skill directories (e.g., '-test' for e2e testing mode)",
+		type: "string",
+	});
 
 	/** Cached provider config, resolved once at session start. */
 	let _providerConfig: ProviderConfig | null = null;
@@ -527,7 +538,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			}
 			const prevFailures = consecutiveFailures;
 			const didRun = await runCycle(flags.repo, ctx);
-			if (didRun && (consecutiveFailures === prevFailures || consecutiveFailures === 0)) {
+			if (shouldIncrementDailyStats(didRun, prevFailures, consecutiveFailures)) {
 				incrementDailyStatsLocal();
 			}
 		},
@@ -675,8 +686,7 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 
 		const scheduleNext = () => {
 			if (!loopActive) return;
-			const backoffMultiplier = consecutiveFailures > 0 ? Math.pow(2, consecutiveFailures) : 1;
-			const actualInterval = baseIntervalMs * backoffMultiplier;
+			const actualInterval = calculateBackoffInterval(baseIntervalMs, consecutiveFailures);
 			const hours = (actualInterval / 3600_000).toFixed(1);
 			loopTimer = setTimeout(loop, actualInterval);
 			emit(`Next review in ${hours} hour(s)`);
@@ -684,27 +694,31 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 
 		const loop = async () => {
 			try {
-				if (!loopActive) return;
+				const today = new Date().toISOString().slice(0, 10);
+				const stats = readJson<DailyStats>(statePath("daily-stats.json"), { date: today, cycleCount: 0 });
+				const decision = decideLoopAction(loopActive, consecutiveFailures, stats, today, LIMITS);
 
-				const blocked = checkSafetyGatesLocal();
-				if (blocked) {
-					emitWarn(blocked);
-					// Check again in 1 hour (e.g., daily limit may reset at midnight)
-					if (loopActive) loopTimer = setTimeout(loop, 3600_000);
-					return;
+				switch (decision.action) {
+					case "stop-inactive":
+						return;
+					case "wait-blocked":
+						emitWarn(decision.reason);
+						if (loopActive) loopTimer = setTimeout(loop, decision.retryMs);
+						return;
+					case "run-cycle":
+						break;
 				}
 
 				const prevFailures = consecutiveFailures;
 				const didRun = await runCycle(repo, ctx);
 
-				// Only count cycles that actually ran toward daily limit
-				if (didRun && (consecutiveFailures === prevFailures || consecutiveFailures === 0)) {
+				if (shouldIncrementDailyStats(didRun, prevFailures, consecutiveFailures)) {
 					incrementDailyStatsLocal();
 				}
 
-				// Circuit breaker (re-check after cycle, since runCycle may have incremented failures)
-				if (consecutiveFailures >= LIMITS.maxConsecutiveFailures) {
-					emitWarn(`Circuit breaker: ${consecutiveFailures} consecutive failures. Loop stopped. Use /review-start to resume.`);
+				const postDecision = decidePostCycle(consecutiveFailures, LIMITS.maxConsecutiveFailures);
+				if (postDecision.action === "stop-circuit-breaker") {
+					emitWarn(`Circuit breaker: ${postDecision.failures} consecutive failures. Loop stopped. Use /review-start to resume.`);
 					loopActive = false;
 					return;
 				}
@@ -713,7 +727,9 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 			} catch (err: any) {
 				emitWarn(`Loop error: ${err.message}`);
 				consecutiveFailures++;
-				if (consecutiveFailures >= LIMITS.maxConsecutiveFailures) {
+
+				const postDecision = decidePostCycle(consecutiveFailures, LIMITS.maxConsecutiveFailures);
+				if (postDecision.action === "stop-circuit-breaker") {
 					loopActive = false;
 					emitWarn("Circuit breaker triggered from loop error. Loop stopped.");
 				} else {
@@ -744,30 +760,27 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 
 			// Check for incomplete cycle from crash recovery
 			const prevCycle = readJson<CycleState>(statePath("cycle.json"), { status: "idle" });
+			const recovery = decideCycleRecovery(prevCycle);
 
-			// Validate recovery file still passes filters (e.g., test files may have been excluded)
-			const recoveryFile = prevCycle.file && isCodeFile(prevCycle.file) ? prevCycle.file : undefined;
-
-			if (prevCycle.status === "verifying" && recoveryFile) {
-				// Resume from verification
-				emit(`Recovering: resuming verification for ${recoveryFile}`);
+			if (recovery.action === "resume-verify") {
+				emit(`Recovering: resuming verification for ${recovery.file}`);
 				await runVerifyRound(repo, ctx);
-				finishCycle(repo, recoveryFile);
+				finishCycle(repo, recovery.file);
 				consecutiveFailures = 0;
 				cleanupOldSessions(statePath("sessions.json"), LIMITS.sessionRetentionDays);
 				trimReviewedFiles(statePath("reviewed-files.json"), repo, LIMITS.maxReviewedFilesPerRepo);
 				return true;
 			}
 
-			if (prevCycle.status !== "idle" && recoveryFile) {
-				emit(`Recovering: restarting review for ${recoveryFile}`);
-			} else if (prevCycle.status !== "idle") {
-				// Previous file no longer valid (e.g., excluded by filter), reset to idle
-				emit(`Skipping recovery for ${prevCycle.file ?? "unknown"} (file excluded by filter)`);
+			if (recovery.action === "restart-review") {
+				emit(`Recovering: restarting review for ${recovery.file}`);
+			} else if (recovery.action === "skip-recovery") {
+				emit(`Skipping recovery for ${recovery.reason}`);
 				updateCycleState({ status: "idle" });
 			}
 
 			// Step 1: Select file
+			const recoveryFile = recovery.action === "restart-review" ? recovery.file : undefined;
 			const file = selectFile(repo, recoveryFile);
 			if (!file) {
 				// All files reviewed is not a failure — just skip this cycle without penalizing
@@ -1080,10 +1093,12 @@ export default function codeReviewExtension(pi: ExtensionAPI): void {
 
 	/** Create a container-isolated sub-agent for a given skill. */
 	function createSubAgent(skillName: string): SubAgentClient {
+		const suffix = (pi.getFlag("review-skill-suffix") as string | undefined) ?? "";
+		const resolvedName = skillName + suffix;
 		const config = getProviderConfig();
-		const skillPath = join(skillsDir, skillName);
+		const skillPath = join(skillsDir, resolvedName);
 		return new SubAgentClient(piCliPath, {
-			args: buildSubAgentArgs(skillName, config),
+			args: buildSubAgentArgs(resolvedName, config),
 			containerMode: {
 				repoDir,
 				stateDir: getStateDir(),

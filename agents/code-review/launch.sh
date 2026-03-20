@@ -46,6 +46,7 @@ INTERVAL="1"
 PROVIDER=""
 MODEL=""
 AUTO_START=false
+SKILL_SUFFIX=""
 
 usage() {
     cat <<EOF
@@ -60,6 +61,7 @@ Optional:
   --provider <name>      AI provider (default: anthropic). e.g., zai, openai, google
   --model <id>           Model ID. e.g., glm-5, gpt-5.4
   --auto-start           Automatically start review loop (default: wait for /review-start)
+  --skill-suffix <str>   Suffix for skill dirs (e.g., "-test" for e2e dry-run mode)
   --help                 Show this help message
 EOF
     exit "${1:-0}"
@@ -91,6 +93,9 @@ while [ $# -gt 0 ]; do
             MODEL="$2"; shift 2 ;;
         --auto-start)
             AUTO_START=true; shift ;;
+        --skill-suffix)
+            require_arg "$@"
+            SKILL_SUFFIX="$2"; shift 2 ;;
         --help|-h)
             usage 0 ;;
         *)
@@ -242,8 +247,8 @@ PI_ARGS=(
     --append-system-prompt "$SCRIPT_DIR/prompts/APPEND_SYSTEM.md"
     --append-system-prompt "$SCRIPT_DIR/prompts/agents.md"
     -e "$SCRIPT_DIR/extensions/code-review.ts"
-    --skill "$SCRIPT_DIR/skills/review"
-    --skill "$SCRIPT_DIR/skills/verify"
+    --skill "$SCRIPT_DIR/skills/review${SKILL_SUFFIX}"
+    --skill "$SCRIPT_DIR/skills/verify${SKILL_SUFFIX}"
     --review-repo "$REPO"
     --review-interval "$INTERVAL"
     --review-data-dir "$DATA_DIR"
@@ -260,6 +265,10 @@ fi
 
 if [ "$AUTO_START" = true ]; then
     PI_ARGS+=(--review-auto-start)
+fi
+
+if [ -n "$SKILL_SUFFIX" ]; then
+    PI_ARGS+=(--review-skill-suffix "$SKILL_SUFFIX")
 fi
 
 exec pi "${PI_ARGS[@]}"
