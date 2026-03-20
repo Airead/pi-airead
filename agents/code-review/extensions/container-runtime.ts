@@ -170,20 +170,48 @@ export function ensureRuntimeRunning(): void {
 	}
 }
 
-/** Ensure the container image exists, building it if needed. */
+/**
+ * Ensure the container image exists, building it if needed.
+ *
+ * Apple Container's buildkit has DNS issues — build with Docker, export as
+ * OCI tarball, and import into Apple Container as a workaround.
+ */
 export function ensureImageBuilt(dockerfilePath: string): void {
 	const bin = runtimeBin();
+	const rt = currentRuntime();
 	try {
 		execFileSync(bin, ["image", "inspect", CONTAINER_IMAGE], {
 			stdio: "pipe",
 			timeout: 10_000,
 		});
 	} catch {
-		console.log(`[container] Building image: ${CONTAINER_IMAGE}`);
-		execFileSync(bin, ["build", "-t", CONTAINER_IMAGE, dockerfilePath], {
-			stdio: "inherit",
-			timeout: 300_000,
-		});
+		if (rt === "apple-container") {
+			console.log(`[container] Building image via Docker (Apple Container buildkit DNS workaround)`);
+			execFileSync("docker", ["build", "-t", CONTAINER_IMAGE, dockerfilePath], {
+				stdio: "inherit",
+				timeout: 300_000,
+			});
+			console.log(`[container] Exporting and importing image into Apple Container...`);
+			const ociTar = join(dockerfilePath, `../${CONTAINER_IMAGE}.tar`);
+			try {
+				execFileSync("docker", ["save", "-o", ociTar, CONTAINER_IMAGE], {
+					stdio: "inherit",
+					timeout: 120_000,
+				});
+				execFileSync("container", ["image", "load", "-i", ociTar], {
+					stdio: "inherit",
+					timeout: 120_000,
+				});
+			} finally {
+				try { execFileSync("rm", ["-f", ociTar], { stdio: "pipe" }); } catch { /* ignore */ }
+			}
+		} else {
+			console.log(`[container] Building image: ${CONTAINER_IMAGE}`);
+			execFileSync(bin, ["build", "-t", CONTAINER_IMAGE, dockerfilePath], {
+				stdio: "inherit",
+				timeout: 300_000,
+			});
+		}
 	}
 }
 
@@ -269,6 +297,11 @@ export function buildContainerArgs(options: {
 	// Apple Container does not support --pids-limit
 	if (rt !== "apple-container") {
 		args.push(`--pids-limit=${CONTAINER_RESOURCE_LIMITS.pidsLimit}`);
+	}
+
+	// Apple Container: default DNS (192.168.64.1) may not work — use public DNS
+	if (rt === "apple-container") {
+		args.push("--dns", "8.8.8.8");
 	}
 
 	// Docker: run as node user (Dockerfile no longer sets USER).
