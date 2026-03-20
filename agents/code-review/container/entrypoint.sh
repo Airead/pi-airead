@@ -2,7 +2,8 @@
 # Container entrypoint for code-review agent.
 #
 # Two modes:
-#   1. Root (Apple Container): shadow .env files via mount --bind, then drop to node user.
+#   1. Root (Apple Container): shadow .env files via mount --bind, run as root.
+#      Apple Container uses VM-level isolation, so root is safe.
 #   2. Non-root (Docker with --user): pass through directly.
 
 set -e
@@ -18,11 +19,6 @@ if [ "$(id -u)" = "0" ]; then
     for f in /workspace/repo/*.env; do
         [ -f "$f" ] && mount --bind /dev/null "$f" 2>/dev/null || true
     done
-
-    # Drop privileges to node user (uid 1000)
-    export HOME=/home/node
-    exec setpriv --reuid=1000 --regid=1000 --clear-groups -- "$@"
 fi
 
-# Already non-root — just run the command
 exec "$@"

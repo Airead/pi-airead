@@ -217,7 +217,7 @@ Sub-agents run inside isolated containers to mitigate prompt injection from audi
 | `.env` file leaks | Docker: shadowed with `/dev/null` file mounts. Apple Container: shadowed via `mount --bind` in entrypoint |
 | Git hook execution | `GIT_CONFIG_NOSYSTEM=1` disables system git config |
 | Resource exhaustion | `--memory=2g --cpus=2 --pids-limit=256` (PIDs limit Docker only) |
-| Container escape | Non-root user (Docker: `--user 1000:1000`; Apple Container: entrypoint drops privileges), no `--privileged`, no docker.sock mount |
+| Container escape | Docker: non-root (`--user 1000:1000`). Apple Container: runs as root but uses VM-level isolation (stronger than Docker namespaces). No `--privileged`, no docker.sock mount |
 | Unauthorized GitHub actions | All `gh` commands run on host side only; containers have no `gh` access |
 
 ### Apple Container Notes
