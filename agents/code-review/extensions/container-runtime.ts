@@ -79,6 +79,26 @@ export function runtimeBin(): string {
 	return currentRuntime() === "apple-container" ? "container" : "docker";
 }
 
+/**
+ * Detect the host's primary DNS server (macOS only).
+ * Falls back to 8.8.8.8 if detection fails.
+ */
+export function detectHostDns(): string {
+	if (platform() === "darwin") {
+		try {
+			const output = execFileSync("scutil", ["--dns"], {
+				encoding: "utf-8",
+				stdio: ["pipe", "pipe", "pipe"],
+				timeout: 5_000,
+			});
+			// Find first nameserver from the primary resolver
+			const match = (output as string).match(/nameserver\[\d+\]\s*:\s*(\d+\.\d+\.\d+\.\d+)/);
+			if (match) return match[1];
+		} catch { /* fall through */ }
+	}
+	return "8.8.8.8";
+}
+
 /** Docker image name for the code review agent. */
 export const CONTAINER_IMAGE = "code-review-agent";
 
@@ -301,7 +321,7 @@ export function buildContainerArgs(options: {
 
 	// Apple Container: default DNS (192.168.64.1) may not work — use public DNS
 	if (rt === "apple-container") {
-		args.push("--dns", "8.8.8.8");
+		args.push("--dns", detectHostDns());
 	}
 
 	// Docker: run as node user (Dockerfile no longer sets USER).

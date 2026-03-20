@@ -8,6 +8,7 @@ import {
 	CONTAINER_HOST_GATEWAY,
 	CONTAINER_IMAGE,
 	currentRuntime,
+	detectHostDns,
 	detectProxyBindHost,
 	findEnvFiles,
 	hostGatewayArgs,
@@ -85,6 +86,17 @@ describe("runtimeBin", () => {
 	it("returns 'container' for apple-container runtime", () => {
 		process.env.CONTAINER_RUNTIME = "apple-container";
 		expect(runtimeBin()).toBe("container");
+	});
+});
+
+// ============================================================================
+// detectProxyBindHost
+// ============================================================================
+
+describe("detectHostDns", () => {
+	it("returns a valid IP address", () => {
+		const dns = detectHostDns();
+		expect(dns).toMatch(/^\d+\.\d+\.\d+\.\d+$/);
 	});
 });
 
@@ -336,7 +348,7 @@ describe("buildContainerArgs (docker)", () => {
 		expect(skillMounts.some((a) => a.includes("/workspace/skills/verify:ro"))).toBe(true);
 	});
 
-	it("does not include NODE_OPTIONS for docker", () => {
+	it("does not include NODE_OPTIONS or --dns for docker", () => {
 		const args = buildContainerArgs({
 			containerName: "test",
 			repoDir: "/host/repo",
@@ -346,6 +358,7 @@ describe("buildContainerArgs (docker)", () => {
 		});
 
 		expect(args.find((a) => a.includes("NODE_OPTIONS"))).toBeUndefined();
+		expect(args).not.toContain("--dns");
 	});
 });
 
@@ -412,6 +425,20 @@ describe("buildContainerArgs (apple-container)", () => {
 		});
 
 		expect(args).toContain("NODE_OPTIONS=--dns-result-order=ipv4first");
+	});
+
+	it("includes --dns with host DNS server", () => {
+		const args = buildContainerArgs({
+			containerName: "test",
+			repoDir: "/host/repo",
+			stateDir: "/host/state",
+			skillDirs: [],
+			piCommand: ["echo"],
+		});
+
+		const dnsIdx = args.indexOf("--dns");
+		expect(dnsIdx).toBeGreaterThan(-1);
+		expect(args[dnsIdx + 1]).toMatch(/^\d+\.\d+\.\d+\.\d+$/);
 	});
 
 	it("uses --mount syntax for readonly mounts", () => {
